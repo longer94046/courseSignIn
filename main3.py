@@ -16,6 +16,8 @@ from reportlab.platypus import TableStyle, Table
 from tkcalendar import DateEntry
 import platform
 import winsound
+import json
+import pyttsx3
 
 DB_FILE = "checkin.db"
 QR_FOLDER = "qrcodes"
@@ -30,6 +32,17 @@ def hash_name(name):
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS org_info (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            org_name TEXT,
+            manager TEXT,
+            contact TEXT
+        )
+        """)
+        # 預設插入一筆資料（僅一筆）
+        c.execute("INSERT OR IGNORE INTO org_info (id, org_name, manager, contact) VALUES (1, '課堂簽到系統', '', '')")
+
         c.execute("""
         CREATE TABLE IF NOT EXISTS classes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,8 +184,9 @@ class ManageAttendeesDialog(tk.Toplevel):
 class CheckInApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("課堂簽到系統")
-        self.root.geometry("1000x700")
+        self.org_info = self.load_org_info()
+        self.root.title(f"{self.org_info.get('org_name', '活動(課程)簽到系統')}-活動(課程)簽到系統")
+        self.root.geometry("1200x800")
 
         init_db()
 
@@ -181,7 +195,8 @@ class CheckInApp:
 
         self.setup_ui()
         self.load_classes()
-
+        self.tts_engine = pyttsx3.init()
+        self.tts_engine.setProperty("rate", 160)  # 語速可調整
     def setup_ui(self):
         style = ttk.Style()
         style.theme_use('clam')  # 使用較現代化的主題
@@ -189,12 +204,12 @@ class CheckInApp:
         top_frame = ttk.Frame(self.root)
         top_frame.pack(pady=10, fill=tk.X)
 
-        ttk.Label(top_frame, text="選擇課堂:").grid(row=0, column=0, sticky=tk.W, padx=5)
-        self.class_combo = ttk.Combobox(top_frame, state="readonly")
+        ttk.Label(top_frame, text="選擇活動(課程):").grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.class_combo = ttk.Combobox(top_frame, state="readonly", width=40)
         self.class_combo.grid(row=0, column=1, sticky=tk.W)
         self.class_combo.bind("<<ComboboxSelected>>", lambda e: self.select_class())
-
-        ttk.Button(top_frame, text="新增課堂", command=self.add_class).grid(row=0, column=2, padx=5)
+        ttk.Button(top_frame, text="設定單位資訊", command=self.set_org_info).grid(row=1, column=5, padx=5)
+        ttk.Button(top_frame, text="新增活動(課程)", command=self.add_class).grid(row=0, column=2, padx=5)
         ttk.Button(top_frame, text="新增週次", command=self.add_session).grid(row=0, column=3, padx=5)
         ttk.Button(top_frame, text="新增學員", command=self.add_attendee).grid(row=0, column=4, padx=5)
         ttk.Button(top_frame, text="管理學員", command=self.open_manage_dialog).grid(row=0, column=5, padx=5)
@@ -202,17 +217,19 @@ class CheckInApp:
         ttk.Button(top_frame, text="刪除選取名單", command=self.delete_selected_attendees).grid(row=0, column=7, padx=5)
 
         ttk.Label(top_frame, text="選擇週次:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.session_combo = ttk.Combobox(top_frame, state="readonly")
+        self.session_combo = ttk.Combobox(top_frame, state="readonly", width=40)
         self.session_combo.grid(row=1, column=1, sticky=tk.W)
         self.session_combo.bind("<<ComboboxSelected>>", lambda e: self.select_session())
 
         ttk.Button(top_frame, text="匯入名單", command=self.import_attendees).grid(row=1, column=2, padx=5)
         ttk.Button(top_frame, text="匯出記錄", command=self.export_records).grid(row=1, column=3, padx=5)
+        ttk.Button(top_frame, text="手動簽到/簽退", command=self.open_manual_check_window).grid(row=1, column=4, padx=5)
 
         ttk.Label(top_frame, text="掃描輸入：").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
         self.scan_entry = ttk.Entry(top_frame, width=50)
         self.scan_entry.grid(row=2, column=1, columnspan=3, sticky=tk.W)
         self.scan_entry.bind("<Return>", self.process_scan)
+
 
         # 建立表格顯示
         self.tree = ttk.Treeview(self.root, columns=("姓名", "部門", "簽到時間", "簽退時間"), show="headings")
@@ -235,6 +252,49 @@ class CheckInApp:
         self.update_time()
         self.update_stats()
 
+    def load_org_info(self):
+        import json
+        if os.path.exists("org_info.json"):
+            try:
+                with open("org_info.json", "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                pass
+        return {"org_name": "活動(課程)簽到系統", "manager": "", "contact": ""}
+
+    def set_org_info(self):
+        top = tk.Toplevel(self.root)
+        top.title("設定單位資訊")
+        top.geometry("350x250")
+        top.resizable(False, False)
+
+        org_var = tk.StringVar(value=self.org_info.get("org_name", ""))
+        mgr_var = tk.StringVar(value=self.org_info.get("manager", ""))
+        contact_var = tk.StringVar(value=self.org_info.get("contact", ""))
+
+        ttk.Label(top, text="機構名稱：").pack(pady=5)
+        ttk.Entry(top, textvariable=org_var).pack(pady=5, fill=tk.X, padx=10)
+
+        ttk.Label(top, text="管理人員：").pack(pady=5)
+        ttk.Entry(top, textvariable=mgr_var).pack(pady=5, fill=tk.X, padx=10)
+
+        ttk.Label(top, text="聯絡方式：").pack(pady=5)
+        ttk.Entry(top, textvariable=contact_var).pack(pady=5, fill=tk.X, padx=10)
+
+        def save():
+            self.org_info = {
+                "org_name": org_var.get().strip(),
+                "manager": mgr_var.get().strip(),
+                "contact": contact_var.get().strip()
+            }
+            with open("org_info.json", "w", encoding="utf-8") as f:
+                json.dump(self.org_info, f, ensure_ascii=False, indent=2)
+            self.root.title(self.org_info["org_name"] or "課堂簽到系統")
+            top.destroy()
+            messagebox.showinfo("完成", "已儲存單位資訊")
+
+        ttk.Button(top, text="儲存", command=save).pack(pady=15)
+
     def update_time(self):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.time_label.config(text=f"目前時間: {now}")
@@ -242,7 +302,7 @@ class CheckInApp:
 
     def update_stats(self):
         if not self.class_id or not self.session_id:
-            self.stats_label.config(text="請先選擇課堂及週次")
+            self.stats_label.config(text="請先選擇活動(課程)及週次")
         else:
             with sqlite3.connect(DB_FILE) as conn:
                 c = conn.cursor()
@@ -281,7 +341,7 @@ class CheckInApp:
             self.update_stats()
 
     def add_class(self):
-        name = simpledialog.askstring("新增課堂", "輸入課堂名稱")
+        name = simpledialog.askstring("新增活動(課程)", "輸入活動(課程)名稱")
         if name:
             with sqlite3.connect(DB_FILE) as conn:
                 c = conn.cursor()
@@ -309,7 +369,7 @@ class CheckInApp:
 
     def add_session(self):
         if not self.class_id:
-            messagebox.showwarning("警告", "請先選擇課堂")
+            messagebox.showwarning("警告", "請先選擇活動(課程)")
             return
 
         top = tk.Toplevel(self.root)
@@ -370,7 +430,7 @@ class CheckInApp:
 
     def add_attendee(self):
         if not self.class_id:
-            messagebox.showwarning("警告", "請先選擇課堂")
+            messagebox.showwarning("警告", "請先選擇活動(課程)")
             return
         top = tk.Toplevel(self.root)
         top.title("新增學員")
@@ -414,7 +474,7 @@ class CheckInApp:
             return
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            # 左連接取出所有該課堂該週次學員簽到簽退時間
+            # 左連接取出所有該活動(課程)該週次學員簽到簽退時間
             c.execute("""
             SELECT a.id, a.name, a.department,
                 ci.check_in_time, ci.check_out_time
@@ -430,6 +490,76 @@ class CheckInApp:
                     cin if cin else "",
                     cout if cout else ""
                 ))
+
+    def open_manual_check_window(self):
+        if not self.session_id:
+            self.show_timed_popup("請先選擇週次", popup_type="warning", duration=4)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("手動輸入備用碼簽到 / 簽退")
+        win.geometry("400x160")
+        win.resizable(False, False)
+
+        ttk.Label(win, text="請輸入備用碼：").pack(pady=10)
+        code_var = tk.StringVar()
+        entry = ttk.Entry(win, textvariable=code_var, font=("Helvetica", 16), width=30)
+        entry.pack(pady=5)
+        entry.focus()
+
+        def check():
+            code = code_var.get().strip()
+            if not code:
+                return
+
+            with sqlite3.connect(DB_FILE) as conn:
+                c = conn.cursor()
+                c.execute("SELECT id, name FROM attendees WHERE class_id=?", (self.class_id,))
+                attendees = c.fetchall()
+
+                matched_attendee = None
+                for aid, name in attendees:
+                    hashed = hash_name(name)
+                    if code == hashed or code == hashed[:10]:
+                        matched_attendee = (aid, name)
+                        break
+
+                if not matched_attendee:
+                    self.show_timed_popup("查無此學員或備用碼錯誤", popup_type="error", duration=5)
+                    return
+
+                aid, name = matched_attendee
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                c.execute("SELECT check_in_time, check_out_time FROM checkins WHERE session_id=? AND attendee_id=?",
+                          (self.session_id, aid))
+                row = c.fetchone()
+
+                if not row:
+                    c.execute("INSERT INTO checkins (session_id, attendee_id, check_in_time) VALUES (?, ?, ?)",
+                              (self.session_id, aid, now_str))
+                    self.show_timed_popup(f"{name} 簽到成功", popup_type="success", duration=5)
+                else:
+                    cin, cout = row
+                    if cin and not cout:
+                        c.execute("UPDATE checkins SET check_out_time=? WHERE session_id=? AND attendee_id=?",
+                                  (now_str, self.session_id, aid))
+                        self.show_timed_popup(f"{name} 簽退成功", popup_type="success", duration=5)
+                    elif cin and cout:
+                        self.show_timed_popup(f"{name} 已簽退，無法重複簽到", popup_type="info", duration=5)
+                    else:
+                        c.execute("UPDATE checkins SET check_in_time=? WHERE session_id=? AND attendee_id=?",
+                                  (now_str, self.session_id, aid))
+                        self.show_timed_popup(f"{name} 簽到成功", popup_type="success", duration=5)
+
+                conn.commit()
+
+            self.load_attendees()
+            self.update_stats()
+            win.destroy()
+            self.scan_entry.focus_set()  # ✅ 執行完自動回到掃描框
+
+        entry.bind("<Return>", lambda e: check())
+        ttk.Button(win, text="確認", command=check).pack(pady=10)
 
     def process_scan(self, event):
         code = self.scan_entry.get().strip()
@@ -525,15 +655,7 @@ class CheckInApp:
         popup.geometry(f"{width}x{height}+{x}+{y}")
         popup.deiconify()
 
-        if platform.system() == "Windows":
-            if popup_type == "success":
-                winsound.MessageBeep(winsound.MB_OK)
-            elif popup_type == "error":
-                winsound.MessageBeep(winsound.MB_ICONHAND)
-            elif popup_type == "warning":
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            else:
-                winsound.MessageBeep()
+
 
         def update_countdown(sec):
             if sec > 0:
@@ -542,34 +664,44 @@ class CheckInApp:
             else:
                 popup.destroy()
                 self.scan_entry.focus_set()
-
+        try:
+            self.tts_engine.say(message)
+            self.tts_engine.runAndWait()
+        except Exception as e:
+            print(f"TTS 撥放失敗：{e}")
         update_countdown(duration)
 
     def import_attendees(self):
         if not self.class_id:
-            messagebox.showwarning("警告", "請先選擇課堂")
+            messagebox.showwarning("警告", "請先選擇活動(課程)")
             return
         file_path = filedialog.askopenfilename(filetypes=[("CSV檔案", "*.csv")])
         if not file_path:
             return
-        with open(file_path, newline='', encoding="utf-8") as csvfile:
-            reader = csv.DictReader(csvfile)
-            added = 0
-            with sqlite3.connect(DB_FILE) as conn:
-                c = conn.cursor()
-                for row in reader:
-                    name = row.get("姓名", "").strip()
-                    dept = row.get("部門", "").strip()
-                    if not name:
-                        continue
-                    c.execute("SELECT id FROM attendees WHERE class_id=? AND name=?", (self.class_id, name))
-                    if c.fetchone():
-                        continue
-                    h = hash_name(name)
-                    c.execute("INSERT INTO attendees (class_id, name, department, hash) VALUES (?, ?, ?, ?)",
-                              (self.class_id, name, dept, h))
-                    added += 1
-                conn.commit()
+        try:
+            with open(file_path, newline='', encoding="utf-8") as csvfile:
+                reader = csv.DictReader(csvfile)
+                rows = list(reader)
+        except UnicodeDecodeError:
+            with open(file_path, newline='', encoding="cp950") as csvfile:
+                reader = csv.DictReader(csvfile)
+                rows = list(reader)
+        added = 0
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            for row in rows:
+                name = row.get("姓名", "").strip()
+                dept = row.get("部門", "").strip()
+                if not name:
+                    continue
+                c.execute("SELECT id FROM attendees WHERE class_id=? AND name=?", (self.class_id, name))
+                if c.fetchone():
+                    continue
+                h = hash_name(name)
+                c.execute("INSERT INTO attendees (class_id, name, department, hash) VALUES (?, ?, ?, ?)",
+                          (self.class_id, name, dept, h))
+                added += 1
+            conn.commit()
         messagebox.showinfo("匯入完成", f"成功匯入 {added} 位學員")
         self.load_attendees()
         self.update_stats()
@@ -644,7 +776,7 @@ class CheckInApp:
             # 匯出 PDF 函數（已整合中文與列印日期）
     def export_records(self):
         if not self.class_id or not self.session_id:
-            messagebox.showwarning("警告", "請先選擇課堂及週次")
+            messagebox.showwarning("警告", "請先選擇活動(課程)及週次")
             return
 
         file_path = filedialog.asksaveasfilename(defaultextension=".pdf",
@@ -668,10 +800,10 @@ class CheckInApp:
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
 
-            # 課堂名稱
+            # 活動(課程)名稱
             c.execute("SELECT name FROM classes WHERE id=?", (self.class_id,))
             row = c.fetchone()
-            class_name = row[0] if row else "(未知課堂)"
+            class_name = row[0] if row else "(未知活動(課程))"
 
             # 堂次資訊
             c.execute("SELECT week, date, start_time, end_time FROM sessions WHERE id=?", (self.session_id,))
@@ -714,11 +846,18 @@ class CheckInApp:
             y = height - 60
             pdf.setFont(font_name, 14)
             pdf.drawString(50, y, "簽到記錄報表")
-
             y -= 20
             pdf.setFont(font_name, 12)
+            # 單位資訊
+            y -= 20
+            pdf.setFont(font_name, 12)
+            pdf.drawString(50, y, f"單位名稱：{self.org_info.get('org_name', '')}")
+            y -= 20
+            pdf.drawString(50, y, f"管理人員：{self.org_info.get('manager', '')}")
+            y -= 20
+            pdf.drawString(50, y, f"聯絡方式：{self.org_info.get('contact', '')}")
+            y -= 20
             pdf.drawString(50, y, f"課程名稱：{class_name}")
-
             y -= 20
             pdf.drawString(50, y, f"堂次資訊：{session_info}")
 
@@ -759,6 +898,11 @@ class CheckInApp:
         if not self.class_id:
             messagebox.showwarning("警告", "請先選擇課堂")
             return
+
+        folder_path = filedialog.askdirectory(title="選擇 QR Code 儲存資料夾")
+        if not folder_path:
+            return
+
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
             c.execute("SELECT name FROM attendees WHERE class_id=?", (self.class_id,))
@@ -766,8 +910,11 @@ class CheckInApp:
             if not names:
                 messagebox.showwarning("警告", "此課堂尚無學員")
                 return
+
             for name in names:
                 h = hash_name(name)
+                backup_code = h[:10]
+
                 qr = qrcode.QRCode(
                     version=1,
                     error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -776,9 +923,29 @@ class CheckInApp:
                 )
                 qr.add_data(h)
                 qr.make(fit=True)
-                img = qr.make_image(fill_color="black", back_color="white")
-                img.save(os.path.join(QR_FOLDER, f"{name}.png"))
-        messagebox.showinfo("完成", f"QR Code已儲存至資料夾 {QR_FOLDER}")
+                qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+                from PIL import ImageDraw, ImageFont
+                width, height = qr_img.size
+                new_height = height + 80
+                final_img = Image.new("RGB", (width, new_height), "white")
+                final_img.paste(qr_img, (0, 0))
+
+                draw = ImageDraw.Draw(final_img)
+                try:
+                    font = ImageFont.truetype("msjh.ttf", 20)
+                except:
+                    font = ImageFont.load_default()
+                text = f"{name}｜備用碼：{backup_code}"
+
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+
+                draw.text(((width - text_width) / 2, height + 10), text, fill="black", font=font)
+                final_img.save(os.path.join(folder_path, f"{name}.png"))
+
+        messagebox.showinfo("完成", f"QR Code（含備用碼）已儲存至 {folder_path}")
 
     def delete_selected_attendees(self):
         selected = self.tree.selection()
@@ -798,7 +965,7 @@ class CheckInApp:
 
     def open_manage_dialog(self):
         if not self.class_id:
-            messagebox.showwarning("警告", "請先選擇課堂")
+            messagebox.showwarning("警告", "請先選擇活動(課程)")
             return
         ManageAttendeesDialog(self.root, self.class_id, self.update_stats)
 
