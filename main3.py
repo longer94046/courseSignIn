@@ -33,6 +33,17 @@ def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0
+        )
+        """)
+        c.execute("INSERT OR IGNORE INTO users (username, password, is_admin) VALUES (?, ?, ?)",
+                 ('admin', hashlib.sha256('admin123'.encode()).hexdigest(), 1))
+        
+        c.execute("""
         CREATE TABLE IF NOT EXISTS org_info (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             org_name TEXT,
@@ -181,6 +192,59 @@ class ManageAttendeesDialog(tk.Toplevel):
         self.load_attendees()
         self.refresh_callback()
 
+class LoginWindow(tk.Toplevel):
+    def __init__(self, parent, callback):
+        super().__init__(parent)
+        self.callback = callback
+        self.title("登入系統")
+        self.geometry("300x200")
+        self.resizable(False, False)
+        
+        # 置中顯示
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f'{width}x{height}+{x}+{y}')
+        
+        # 建立登入表單
+        frame = ttk.Frame(self, padding="20")
+        frame.pack(expand=True, fill=tk.BOTH)
+        
+        ttk.Label(frame, text="帳號：").pack(pady=5)
+        self.username_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.username_var).pack(pady=5, fill=tk.X)
+        
+        ttk.Label(frame, text="密碼：").pack(pady=5)
+        self.password_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.password_var, show="*").pack(pady=5, fill=tk.X)
+        
+        ttk.Button(frame, text="登入", command=self.login).pack(pady=10)
+        
+        # 綁定 Enter 鍵
+        self.bind("<Return>", lambda e: self.login())
+        
+    def login(self):
+        username = self.username_var.get().strip()
+        password = self.password_var.get().strip()
+        
+        if not username or not password:
+            messagebox.showwarning("警告", "請輸入帳號和密碼")
+            return
+            
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, is_admin FROM users WHERE username=? AND password=?",
+                     (username, hashlib.sha256(password.encode()).hexdigest()))
+            user = c.fetchone()
+            
+            if user:
+                self.callback(True, user[0], bool(user[1]))
+                self.destroy()
+            else:
+                messagebox.showerror("錯誤", "帳號或密碼錯誤")
+
 class CheckInApp:
     def __init__(self, root):
         self.root = root
@@ -188,22 +252,30 @@ class CheckInApp:
         self.root.title(f"{self.org_info.get('org_name', '活動(課程)簽到系統')}-活動(課程)簽到系統")
         self.root.geometry("1200x800")
 
+        # 確保資料庫初始化
         init_db()
 
         self.class_id = None
         self.session_id = None
+        self.user_id = None
+        self.is_admin = False
 
         self.setup_ui()
         self.load_classes()
         self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty("rate", 160)  # 語速可調整
+        self.tts_engine.setProperty("rate", 160)
+
     def setup_ui(self):
         style = ttk.Style()
-        style.theme_use('clam')  # 使用較現代化的主題
+        style.theme_use('clam')
 
         top_frame = ttk.Frame(self.root)
         top_frame.pack(pady=10, fill=tk.X)
 
+        # 新增使用者管理按鈕（僅管理員可見）
+        self.user_mgmt_btn = ttk.Button(top_frame, text="使用者管理", command=self.open_user_management)
+        self.user_mgmt_btn.grid(row=0, column=8, padx=5)
+        
         ttk.Label(top_frame, text="選擇活動(課程):").grid(row=0, column=0, sticky=tk.W, padx=5)
         self.class_combo = ttk.Combobox(top_frame, state="readonly", width=40)
         self.class_combo.grid(row=0, column=1, sticky=tk.W)
@@ -229,7 +301,6 @@ class CheckInApp:
         self.scan_entry = ttk.Entry(top_frame, width=50)
         self.scan_entry.grid(row=2, column=1, columnspan=3, sticky=tk.W)
         self.scan_entry.bind("<Return>", self.process_scan)
-
 
         # 建立表格顯示
         self.tree = ttk.Treeview(self.root, columns=("姓名", "部門", "簽到時間", "簽退時間"), show="headings")
@@ -614,9 +685,6 @@ class CheckInApp:
         self.load_attendees()
         self.update_stats()
 
-    import platform
-    import winsound  # 只適用於 Windows
-
     def show_timed_popup(self, message, popup_type="info", duration=5):
         popup = tk.Toplevel(self.root)
         popup.withdraw()
@@ -654,8 +722,6 @@ class CheckInApp:
         y = screen_height - height - 60
         popup.geometry(f"{width}x{height}+{x}+{y}")
         popup.deiconify()
-
-
 
         def update_countdown(sec):
             if sec > 0:
@@ -706,74 +772,6 @@ class CheckInApp:
         self.load_attendees()
         self.update_stats()
 
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen.canvas import Canvas
-    from reportlab.lib import colors
-    from reportlab.platypus import Table, TableStyle
-    from datetime import datetime
-
-    from reportlab.pdfgen.canvas import Canvas
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib import colors
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    import os
-    import platform
-    from datetime import datetime
-
-
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib import colors
-    from reportlab.platypus import Table, TableStyle
-    from datetime import datetime
-
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen.canvas import Canvas
-    from reportlab.lib import colors
-    from reportlab.platypus import Table, TableStyle
-    from datetime import datetime
-
-    import tkinter as tk
-    from tkinter import ttk, messagebox, filedialog, simpledialog
-    import sqlite3
-    import csv
-    import hashlib
-    import qrcode
-    import os
-    from datetime import datetime
-    from PIL import Image, ImageTk
-    from tkcalendar import DateEntry
-    import platform
-    import winsound
-
-    # 新增：PDF 匯出所需
-    from reportlab.pdfgen.canvas import Canvas
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib import colors
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-
-    DB_FILE = "checkin.db"
-    QR_FOLDER = "qrcodes"
-    QR_SEED = "secure_seed_2024"
-
-    if not os.path.exists(QR_FOLDER):
-        os.makedirs(QR_FOLDER)
-
-    # ... 其他函數與類別省略（保留原始內容）
-
-    class CheckInApp:
-        def __init__(self, root):
-            self.root = root
-            self.class_id = None
-            self.session_id = None
-            # 其他初始化...
-
-        # 匯出 PDF 函數（已整合中文與列印日期）
-            # 匯出 PDF 函數（已整合中文與列印日期）
     def export_records(self):
         if not self.class_id or not self.session_id:
             messagebox.showwarning("警告", "請先選擇活動(課程)及週次")
@@ -890,10 +888,6 @@ class CheckInApp:
         except Exception as e:
             messagebox.showerror("錯誤", f"匯出 PDF 失敗：{e}")
 
-        # 其餘類別與主程式入口省略...（如 main()）
-
-    # 其餘類別與主程式入口省略...（如 main()）
-
     def generate_qrcodes(self):
         if not self.class_id:
             messagebox.showwarning("警告", "請先選擇課堂")
@@ -969,9 +963,125 @@ class CheckInApp:
             return
         ManageAttendeesDialog(self.root, self.class_id, self.update_stats)
 
+    def open_user_management(self):
+        if not self.is_admin:
+            messagebox.showwarning("警告", "只有管理員可以使用此功能")
+            return
+            
+        win = tk.Toplevel(self.root)
+        win.title("使用者管理")
+        win.geometry("500x400")
+        win.resizable(False, False)
+
+        # 建立使用者列表
+        tree = ttk.Treeview(win, columns=("username", "is_admin"), show="headings")
+        tree.heading("username", text="帳號")
+        tree.heading("is_admin", text="管理員權限")
+        tree.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+
+        def load_users():
+            for item in tree.get_children():
+                tree.delete(item)
+            with sqlite3.connect(DB_FILE) as conn:
+                c = conn.cursor()
+                c.execute("SELECT id, username, is_admin FROM users")
+                for uid, username, is_admin in c.fetchall():
+                    tree.insert("", tk.END, iid=uid, values=(username, "是" if is_admin else "否"))
+
+        def add_user():
+            dialog = tk.Toplevel(win)
+            dialog.title("新增使用者")
+            dialog.geometry("300x200")
+            dialog.resizable(False, False)
+
+            ttk.Label(dialog, text="帳號：").pack(pady=5)
+            username_var = tk.StringVar()
+            ttk.Entry(dialog, textvariable=username_var).pack(pady=5, fill=tk.X, padx=10)
+
+            ttk.Label(dialog, text="密碼：").pack(pady=5)
+            password_var = tk.StringVar()
+            ttk.Entry(dialog, textvariable=password_var, show="*").pack(pady=5, fill=tk.X, padx=10)
+
+            is_admin_var = tk.BooleanVar()
+            ttk.Checkbutton(dialog, text="管理員權限", variable=is_admin_var).pack(pady=5)
+
+            def save():
+                username = username_var.get().strip()
+                password = password_var.get().strip()
+                if not username or not password:
+                    messagebox.showwarning("警告", "請輸入帳號和密碼")
+                    return
+                try:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        c = conn.cursor()
+                        c.execute("INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)",
+                                (username, hashlib.sha256(password.encode()).hexdigest(), int(is_admin_var.get())))
+                        conn.commit()
+                    dialog.destroy()
+                    load_users()
+                except sqlite3.IntegrityError:
+                    messagebox.showerror("錯誤", "帳號已存在")
+
+            ttk.Button(dialog, text="儲存", command=save).pack(pady=10)
+
+        def delete_user():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("警告", "請選擇要刪除的使用者")
+                return
+            if messagebox.askyesno("確認", "確定要刪除選取的使用者嗎？"):
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    for uid in selected:
+                        c.execute("DELETE FROM users WHERE id=?", (uid,))
+                    conn.commit()
+                load_users()
+
+        def reset_password():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("警告", "請選擇要重設密碼的使用者")
+                return
+            if len(selected) > 1:
+                messagebox.showwarning("警告", "一次只能重設一個使用者的密碼")
+                return
+                
+            new_password = simpledialog.askstring("重設密碼", "請輸入新密碼：", show="*")
+            if new_password:
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    c.execute("UPDATE users SET password=? WHERE id=?",
+                            (hashlib.sha256(new_password.encode()).hexdigest(), selected[0]))
+                    conn.commit()
+                messagebox.showinfo("成功", "密碼已重設")
+
+        # 按鈕框架
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text="新增使用者", command=add_user).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="刪除使用者", command=delete_user).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="重設密碼", command=reset_password).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="關閉", command=win.destroy).pack(side=tk.RIGHT, padx=5)
+
+        load_users()
+
 def main():
     root = tk.Tk()
-    app = CheckInApp(root)
+    root.withdraw()  # 隱藏主視窗
+    
+    def on_login(success, user_id, is_admin):
+        if success:
+            root.deiconify()  # 顯示主視窗
+            app = CheckInApp(root)
+            app.user_id = user_id
+            app.is_admin = is_admin
+            if not is_admin:
+                app.user_mgmt_btn.grid_remove()  # 隱藏使用者管理按鈕
+            root.mainloop()
+        else:
+            root.destroy()
+    
+    login_window = LoginWindow(root, on_login)
     root.mainloop()
 
 if __name__ == "__main__":
