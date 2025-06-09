@@ -5,6 +5,7 @@ import csv
 import hashlib
 import qrcode
 import os
+import sys
 from datetime import datetime
 from PIL import Image, ImageTk
 from reportlab.lib import colors
@@ -69,42 +70,96 @@ def init_db():
             end_time TEXT,
             FOREIGN KEY (class_id) REFERENCES classes(id)
         )""")
+        
+        # 新增學員基本資料表
         c.execute("""
-        CREATE TABLE IF NOT EXISTS attendees (
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            department TEXT,
+            hash TEXT UNIQUE,
+            gender TEXT,
+            address TEXT,
+            phone TEXT,
+            id_number TEXT,
+            dietary TEXT
+        )""")
+        
+        # 新增自定義欄位表
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS custom_fields (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            field_name TEXT NOT NULL,
+            field_type TEXT NOT NULL,
+            is_required INTEGER DEFAULT 0,
+            display_order INTEGER DEFAULT 0
+        )""")
+        
+        # 新增學員自定義欄位值表
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS student_custom_values (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER,
+            field_id INTEGER,
+            field_value TEXT,
+            FOREIGN KEY (student_id) REFERENCES students(id),
+            FOREIGN KEY (field_id) REFERENCES custom_fields(id)
+        )""")
+        
+        # 修改課程學員關聯表
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS class_students (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             class_id INTEGER,
-            name TEXT,
-            department TEXT,
-            hash TEXT,
-            FOREIGN KEY (class_id) REFERENCES classes(id)
+            student_id INTEGER,
+            FOREIGN KEY (class_id) REFERENCES classes(id),
+            FOREIGN KEY (student_id) REFERENCES students(id),
+            UNIQUE(class_id, student_id)
         )""")
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER,
-            attendee_id INTEGER,
-            checkin_time TEXT,
-            checkout_time TEXT,
-            FOREIGN KEY (session_id) REFERENCES sessions(id),
-            FOREIGN KEY (attendee_id) REFERENCES attendees(id)
-        )""")
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS session_attendees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER,
-            attendee_id INTEGER,
-            FOREIGN KEY (session_id) REFERENCES sessions(id),
-            FOREIGN KEY (attendee_id) REFERENCES attendees(id)
-        )""")
+        
         c.execute("""
         CREATE TABLE IF NOT EXISTS checkins (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id INTEGER,
-            attendee_id INTEGER,
+            student_id INTEGER,
             check_in_time TEXT,
             check_out_time TEXT,
-            UNIQUE(session_id, attendee_id)
+            UNIQUE(session_id, student_id)
         )""")
+        
+        # 插入預設欄位
+        c.execute("""
+        INSERT OR IGNORE INTO custom_fields (field_name, field_type, is_required, display_order) VALUES 
+        ('性別', 'select', 1, 1),
+        ('住址', 'text', 0, 2),
+        ('連絡電話', 'text', 0, 3),
+        ('身分證號', 'text', 0, 4),
+        ('餐飲葷素', 'select', 0, 5)
+        """)
+        # 刪除重複的「飲食習慣」欄位
+        c.execute("DELETE FROM custom_fields WHERE field_name='飲食習慣'")
+        
+        # 插入性別選項
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS field_options (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            field_id INTEGER,
+            option_value TEXT,
+            display_order INTEGER DEFAULT 0,
+            FOREIGN KEY (field_id) REFERENCES custom_fields(id)
+        )""")
+        
+        # 插入預設選項
+        c.execute("""
+        INSERT OR IGNORE INTO field_options (field_id, option_value, display_order) VALUES 
+        (1, '男', 1),
+        (1, '女', 2),
+        (1, '其他', 3),
+        (5, '葷食', 1),
+        (5, '素食', 2)
+        """)
+        # 刪除性別欄位重複選項，只保留「男」「女」「其他」
+        c.execute("DELETE FROM field_options WHERE field_id=1 AND option_value NOT IN ('男','女','其他')")
     conn.commit()
 
 class ManageAttendeesDialog(tk.Toplevel):
@@ -112,94 +167,115 @@ class ManageAttendeesDialog(tk.Toplevel):
         super().__init__(parent)
         self.class_id = class_id
         self.refresh_callback = refresh_callback
-        self.title("管理學員")
-        self.geometry("400x400")
+        self.title("管理課程學員")
+        self.geometry("600x500")
         self.resizable(False, False)
 
-        self.tree = ttk.Treeview(self, columns=("name", "dept"), show="headings")
+        # 建立搜尋框架
+        search_frame = ttk.Frame(self)
+        search_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(search_frame, text="搜尋：").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', self.filter_students)
+        ttk.Entry(search_frame, textvariable=self.search_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # 建立學員列表
+        self.tree = ttk.Treeview(self, columns=("name", "dept", "status"), show="headings")
         self.tree.heading("name", text="姓名")
         self.tree.heading("dept", text="部門")
-        self.tree.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
-        self.show_timed_popup = self.show_timed_popup.__get__(self)
+        self.tree.heading("status", text="狀態")
+        self.tree.pack(expand=True, fill=tk.BOTH, padx=10, pady=5)
 
+        # 建立按鈕框架
         btn_frame = ttk.Frame(self)
         btn_frame.pack(pady=5)
-
-        ttk.Button(btn_frame, text="新增學員", command=self.add_attendee).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="刪除選取", command=self.delete_selected).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(btn_frame, text="新增選取學員", command=self.add_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="移除選取學員", command=self.remove_selected).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="關閉", command=self.destroy).pack(side=tk.RIGHT, padx=5)
 
-        self.load_attendees()
+        self.load_students()
 
-    def load_attendees(self):
+    def load_students(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
+        
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            c.execute("SELECT id, name, department FROM attendees WHERE class_id=?", (self.class_id,))
-            for aid, name, dept in c.fetchall():
-                self.tree.insert("", tk.END, iid=aid, values=(name, dept))
+            # 取得所有學員
+            c.execute("""
+                SELECT s.id, s.name, s.department, 
+                       CASE WHEN cs.id IS NOT NULL THEN '已加入' ELSE '未加入' END as status
+                FROM students s
+                LEFT JOIN class_students cs ON cs.student_id = s.id AND cs.class_id = ?
+                ORDER BY s.name
+            """, (self.class_id,))
+            
+            for sid, name, dept, status in c.fetchall():
+                self.tree.insert("", tk.END, iid=sid, values=(name, dept, status))
 
-    def add_attendee(self):
-        def save():
-            name = name_var.get().strip()
-            dept = dept_var.get().strip()
-            if not name:
-                messagebox.showwarning("警告", "姓名不能為空")
-                return
-            with sqlite3.connect(DB_FILE) as conn:
-                c = conn.cursor()
-                c.execute("SELECT id FROM attendees WHERE class_id=? AND name=?", (self.class_id, name))
-                if c.fetchone():
-                    messagebox.showwarning("警告", "該學員已存在")
-                    return
-                h = hash_name(name)
-                c.execute("INSERT INTO attendees (class_id, name, department, hash) VALUES (?, ?, ?, ?)",
-                          (self.class_id, name, dept, h))
-                conn.commit()
-            top.destroy()
-            self.load_attendees()
-            self.refresh_callback()
+    def filter_students(self, *args):
+        search_text = self.search_var.get().lower()
+        for item in self.tree.get_children():
+            values = self.tree.item(item)['values']
+            if search_text in values[0].lower() or search_text in values[1].lower():
+                self.tree.item(item, tags=())
+            else:
+                self.tree.item(item, tags=('hidden',))
+        self.tree.tag_configure('hidden', foreground='gray')
 
-        top = tk.Toplevel(self)
-        top.title("新增學員")
-        top.geometry("300x150")
-        top.resizable(False, False)
-
-        ttk.Label(top, text="姓名:").pack(pady=5)
-        name_var = tk.StringVar()
-        ttk.Entry(top, textvariable=name_var).pack(pady=5, fill=tk.X, padx=10)
-
-        ttk.Label(top, text="部門:").pack(pady=5)
-        dept_var = tk.StringVar()
-        ttk.Entry(top, textvariable=dept_var).pack(pady=5, fill=tk.X, padx=10)
-
-        ttk.Button(top, text="儲存", command=save).pack(pady=10)
-
-    def delete_selected(self):
+    def add_selected(self):
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning("警告", "請先選擇欲刪除的學員")
+            messagebox.showwarning("警告", "請選擇要新增的學員")
             return
-        confirm = messagebox.askyesno("確認刪除", f"確定刪除選取的 {len(selected)} 位學員嗎？")
-        if not confirm:
-            return
+        
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            for aid in selected:
-                c.execute("DELETE FROM attendees WHERE id=?", (aid,))
+            added = 0
+            for sid in selected:
+                try:
+                    c.execute("INSERT INTO class_students (class_id, student_id) VALUES (?, ?)",
+                            (self.class_id, sid))
+                    added += 1
+                except sqlite3.IntegrityError:
+                    continue
             conn.commit()
-        self.load_attendees()
-        self.refresh_callback()
+        
+        if added > 0:
+            messagebox.showinfo("成功", f"已新增 {added} 位學員")
+            self.load_students()
+            self.refresh_callback()
+
+    def remove_selected(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("警告", "請選擇要移除的學員")
+            return
+        
+        if messagebox.askyesno("確認", f"確定要移除選取的 {len(selected)} 位學員嗎？"):
+            with sqlite3.connect(DB_FILE) as conn:
+                c = conn.cursor()
+                for sid in selected:
+                    c.execute("DELETE FROM class_students WHERE class_id=? AND student_id=?",
+                            (self.class_id, sid))
+                conn.commit()
+            self.load_students()
+            self.refresh_callback()
 
 class LoginWindow(tk.Toplevel):
     def __init__(self, parent, callback):
         super().__init__(parent)
         self.callback = callback
-        self.title("登入系統")
-        self.geometry("300x200")
+        # 讀取機構資訊
+        org_info = self.load_org_info()
+        org_name = org_info.get('org_name', '活動(課程)管理系統')
+        self.title(f"{org_name}-活動(課程)管理系統登入")
+        self.geometry("300x300")  # 增加高度以容納所有元件
         self.resizable(False, False)
-        
+        self.grab_set()
+        self.focus_force()
         # 置中顯示
         self.update_idletasks()
         width = self.winfo_width()
@@ -207,39 +283,71 @@ class LoginWindow(tk.Toplevel):
         x = (self.winfo_screenwidth() // 2) - (width // 2)
         y = (self.winfo_screenheight() // 2) - (height // 2)
         self.geometry(f'{width}x{height}+{x}+{y}')
-        
         # 建立登入表單
         frame = ttk.Frame(self, padding="20")
         frame.pack(expand=True, fill=tk.BOTH)
         
-        ttk.Label(frame, text="帳號：").pack(pady=5)
+        # 添加組織名稱標籤
+        title_label = ttk.Label(frame, text=f"{org_name}", font=("Microsoft JhengHei", 14, "bold"))
+        title_label.pack(pady=(0, 5))
+        subtitle_label = ttk.Label(frame, text="活動(課程)管理系統登入", font=("Microsoft JhengHei", 12))
+        subtitle_label.pack(pady=(0, 15))
+        
+        # 建立輸入框架
+        input_frame = ttk.Frame(frame)
+        input_frame.pack(fill=tk.X, pady=5)
+        
+        # 帳號 row
+        ttk.Label(input_frame, text="👤", font=("Microsoft JhengHei", 12)).grid(row=0, column=0, padx=(0, 5), pady=5, sticky="w")
+        ttk.Label(input_frame, text="帳號：", font=("Microsoft JhengHei", 10)).grid(row=0, column=1, sticky="e", pady=5)
         self.username_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.username_var).pack(pady=5, fill=tk.X)
+        username_entry = ttk.Entry(input_frame, textvariable=self.username_var, font=("Microsoft JhengHei", 10))
+        username_entry.grid(row=0, column=2, sticky="we", padx=(5, 0), pady=5)
         
-        ttk.Label(frame, text="密碼：").pack(pady=5)
+        # 密碼 row
+        ttk.Label(input_frame, text="🔒", font=("Microsoft JhengHei", 12)).grid(row=1, column=0, padx=(0, 5), pady=5, sticky="w")
+        ttk.Label(input_frame, text="密碼：", font=("Microsoft JhengHei", 10)).grid(row=1, column=1, sticky="e", pady=5)
         self.password_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.password_var, show="*").pack(pady=5, fill=tk.X)
+        password_entry = ttk.Entry(input_frame, textvariable=self.password_var, show="*", font=("Microsoft JhengHei", 10))
+        password_entry.grid(row=1, column=2, sticky="we", padx=(5, 0), pady=5)
         
-        ttk.Button(frame, text="登入", command=self.login).pack(pady=10)
+        input_frame.columnconfigure(2, weight=1)
         
-        # 綁定 Enter 鍵
+        # 建立按鈕框架
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=10)
+        login_button = ttk.Button(button_frame, text="登入", command=self.login, width=20)
+        login_button.pack()
+        
+        # 設定按鈕字體
+        style = ttk.Style()
+        style.configure("TButton", font=("Microsoft JhengHei", 10))
+        
         self.bind("<Return>", lambda e: self.login())
-        
+
+    def load_org_info(self):
+        import json
+        if os.path.exists("org_info.json"):
+            try:
+                with open("org_info.json", "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                pass
+        return {"org_name": "活動(課程)管理系統", "manager": "", "contact": ""}
+
     def login(self):
         username = self.username_var.get().strip()
         password = self.password_var.get().strip()
-        
         if not username or not password:
             messagebox.showwarning("警告", "請輸入帳號和密碼")
             return
-            
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
             c.execute("SELECT id, is_admin FROM users WHERE username=? AND password=?",
                      (username, hashlib.sha256(password.encode()).hexdigest()))
             user = c.fetchone()
-            
             if user:
+                self.grab_release()
                 self.callback(True, user[0], bool(user[1]))
                 self.destroy()
             else:
@@ -248,18 +356,17 @@ class LoginWindow(tk.Toplevel):
 class CheckInApp:
     def __init__(self, root):
         self.root = root
+        self._after_ids = []
         self.org_info = self.load_org_info()
         self.root.title(f"{self.org_info.get('org_name', '活動(課程)簽到系統')}-活動(課程)簽到系統")
         self.root.geometry("1200x800")
-
-        # 確保資料庫初始化
-        init_db()
 
         self.class_id = None
         self.session_id = None
         self.user_id = None
         self.is_admin = False
 
+        self.main_widgets = []  # 新增：記錄所有主介面元件
         self.setup_ui()
         self.load_classes()
         self.tts_engine = pyttsx3.init()
@@ -271,6 +378,7 @@ class CheckInApp:
 
         top_frame = ttk.Frame(self.root)
         top_frame.pack(pady=10, fill=tk.X)
+        self.main_widgets.append(top_frame)  # 新增
 
         # 新增使用者管理按鈕（僅管理員可見）
         self.user_mgmt_btn = ttk.Button(top_frame, text="使用者管理", command=self.open_user_management)
@@ -283,8 +391,8 @@ class CheckInApp:
         ttk.Button(top_frame, text="設定單位資訊", command=self.set_org_info).grid(row=1, column=5, padx=5)
         ttk.Button(top_frame, text="新增活動(課程)", command=self.add_class).grid(row=0, column=2, padx=5)
         ttk.Button(top_frame, text="新增週次", command=self.add_session).grid(row=0, column=3, padx=5)
-        ttk.Button(top_frame, text="新增學員", command=self.add_attendee).grid(row=0, column=4, padx=5)
-        ttk.Button(top_frame, text="管理學員", command=self.open_manage_dialog).grid(row=0, column=5, padx=5)
+        ttk.Button(top_frame, text="學員管理", command=self.open_student_management).grid(row=0, column=4, padx=5)
+        ttk.Button(top_frame, text="管理課程學員", command=self.open_manage_dialog).grid(row=0, column=5, padx=5)
         ttk.Button(top_frame, text="產生QR Code", command=self.generate_qrcodes).grid(row=0, column=6, padx=5)
         ttk.Button(top_frame, text="刪除選取名單", command=self.delete_selected_attendees).grid(row=0, column=7, padx=5)
 
@@ -303,12 +411,18 @@ class CheckInApp:
         self.scan_entry.bind("<Return>", self.process_scan)
 
         # 建立表格顯示
-        self.tree = ttk.Treeview(self.root, columns=("姓名", "部門", "簽到時間", "簽退時間"), show="headings")
+        tree_frame = ttk.Frame(self.root)
+        tree_frame.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+        self.tree = ttk.Treeview(tree_frame, columns=("姓名", "部門", "簽到時間", "簽退時間"), show="headings")
         self.tree.heading("姓名", text="姓名")
         self.tree.heading("部門", text="部門")
         self.tree.heading("簽到時間", text="簽到時間")
         self.tree.heading("簽退時間", text="簽退時間")
-        self.tree.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+        self.tree.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+        # 加入橫向scrollbar
+        xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        xscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree.configure(xscrollcommand=xscroll.set)
 
         # 狀態區：目前時間 + 統計資訊
         bottom_frame = ttk.Frame(self.root)
@@ -322,6 +436,34 @@ class CheckInApp:
 
         self.update_time()
         self.update_stats()
+
+        # 登出鈕放在 top_frame 最右側
+        self.logout_btn = ttk.Button(top_frame, text="登出", command=self.logout_callback)
+        self.logout_btn.grid(row=0, column=99, padx=5, sticky="e")
+        self.main_widgets.append(self.logout_btn)
+
+        # 在 update_time, update_stats 等 after 任務都要記錄 after_id
+        self._after_ids.append(self.root.after(1000, self.update_time))
+        self._after_ids.append(self.root.after(1000, self.update_stats))
+
+    def set_logout_callback(self, callback):
+        self.logout_callback = callback
+
+    def destroy(self):
+        # 取消所有 after 任務
+        for after_id in getattr(self, '_after_ids', []):
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._after_ids = []
+        # 銷毀 root 下所有 widget（除了 LoginWindow）
+        for widget in self.root.winfo_children():
+            if not isinstance(widget, LoginWindow):
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
 
     def load_org_info(self):
         import json
@@ -377,15 +519,15 @@ class CheckInApp:
         else:
             with sqlite3.connect(DB_FILE) as conn:
                 c = conn.cursor()
-                c.execute("SELECT COUNT(*) FROM attendees WHERE class_id=?", (self.class_id,))
+                c.execute("SELECT COUNT(*) FROM students s INNER JOIN class_students cs ON cs.student_id = s.id WHERE cs.class_id=?", (self.class_id,))
                 total = c.fetchone()[0]
 
-                c.execute("SELECT COUNT(DISTINCT attendee_id) FROM checkins WHERE session_id=? AND check_in_time IS NOT NULL", (self.session_id,))
+                c.execute("SELECT COUNT(DISTINCT student_id) FROM checkins WHERE session_id=? AND check_in_time IS NOT NULL", (self.session_id,))
                 checked_in = c.fetchone()[0]
 
                 unchecked_in = total - checked_in
 
-                c.execute("SELECT COUNT(DISTINCT attendee_id) FROM checkins WHERE session_id=? AND check_out_time IS NOT NULL", (self.session_id,))
+                c.execute("SELECT COUNT(DISTINCT student_id) FROM checkins WHERE session_id=? AND check_out_time IS NOT NULL", (self.session_id,))
                 checked_out = c.fetchone()[0]
 
                 unchecked_out = checked_in - checked_out
@@ -499,45 +641,6 @@ class CheckInApp:
         # ✅ 修正：確保這個按鈕在 `save` 完整定義後才出現
         ttk.Button(top, text="儲存", command=save).pack(pady=10)
 
-    def add_attendee(self):
-        if not self.class_id:
-            messagebox.showwarning("警告", "請先選擇活動(課程)")
-            return
-        top = tk.Toplevel(self.root)
-        top.title("新增學員")
-        top.geometry("300x220")
-        top.resizable(False, False)
-
-        ttk.Label(top, text="姓名:").pack(pady=5)
-        name_var = tk.StringVar()
-        ttk.Entry(top, textvariable=name_var).pack(pady=5, fill=tk.X, padx=10)
-
-        ttk.Label(top, text="部門:").pack(pady=5)
-        dept_var = tk.StringVar()
-        ttk.Entry(top, textvariable=dept_var).pack(pady=5, fill=tk.X, padx=10)
-
-        def save():
-            name = name_var.get().strip()
-            dept = dept_var.get().strip()
-            if not name:
-                messagebox.showwarning("警告", "姓名不能為空")
-                return
-            with sqlite3.connect(DB_FILE) as conn:
-                c = conn.cursor()
-                c.execute("SELECT id FROM attendees WHERE class_id=? AND name=?", (self.class_id, name))
-                if c.fetchone():
-                    messagebox.showwarning("警告", "該學員已存在")
-                    return
-                h = hash_name(name)
-                c.execute("INSERT INTO attendees (class_id, name, department, hash) VALUES (?, ?, ?, ?)",
-                          (self.class_id, name, dept, h))
-                conn.commit()
-            top.destroy()
-            self.load_attendees()
-            self.update_stats()
-
-        ttk.Button(top, text="儲存", command=save).pack(pady=10)
-
     def load_attendees(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
@@ -545,18 +648,18 @@ class CheckInApp:
             return
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            # 左連接取出所有該活動(課程)該週次學員簽到簽退時間
             c.execute("""
-            SELECT a.id, a.name, a.department,
+            SELECT s.id, s.name, s.department,
                 ci.check_in_time, ci.check_out_time
-            FROM attendees a
-            LEFT JOIN checkins ci ON ci.attendee_id=a.id AND ci.session_id=?
-            WHERE a.class_id=?
-            ORDER BY a.name
+            FROM students s
+            INNER JOIN class_students cs ON cs.student_id = s.id
+            LEFT JOIN checkins ci ON ci.student_id = s.id AND ci.session_id = ?
+            WHERE cs.class_id = ?
+            ORDER BY s.name
             """, (self.session_id, self.class_id))
             rows = c.fetchall()
-            for aid, name, dept, cin, cout in rows:
-                self.tree.insert("", tk.END, iid=aid, values=(
+            for sid, name, dept, cin, cout in rows:
+                self.tree.insert("", tk.END, iid=sid, values=(
                     name, dept,
                     cin if cin else "",
                     cout if cout else ""
@@ -585,41 +688,40 @@ class CheckInApp:
 
             with sqlite3.connect(DB_FILE) as conn:
                 c = conn.cursor()
-                c.execute("SELECT id, name FROM attendees WHERE class_id=?", (self.class_id,))
-                attendees = c.fetchall()
+                c.execute("SELECT id, name FROM students WHERE class_id=?", (self.class_id,))
+                students = c.fetchall()
 
-                matched_attendee = None
-                for aid, name in attendees:
-                    hashed = hash_name(name)
-                    if code == hashed or code == hashed[:10]:
-                        matched_attendee = (aid, name)
+                matched_student = None
+                for sid, name in students:
+                    if hash_name(name) == code:
+                        matched_student = (sid, name)
                         break
 
-                if not matched_attendee:
+                if not matched_student:
                     self.show_timed_popup("查無此學員或備用碼錯誤", popup_type="error", duration=5)
                     return
 
-                aid, name = matched_attendee
+                sid, name = matched_student
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                c.execute("SELECT check_in_time, check_out_time FROM checkins WHERE session_id=? AND attendee_id=?",
-                          (self.session_id, aid))
+                c.execute("SELECT check_in_time, check_out_time FROM checkins WHERE session_id=? AND student_id=?",
+                          (self.session_id, sid))
                 row = c.fetchone()
 
                 if not row:
-                    c.execute("INSERT INTO checkins (session_id, attendee_id, check_in_time) VALUES (?, ?, ?)",
-                              (self.session_id, aid, now_str))
+                    c.execute("INSERT INTO checkins (session_id, student_id, check_in_time) VALUES (?, ?, ?)",
+                              (self.session_id, sid, now_str))
                     self.show_timed_popup(f"{name} 簽到成功", popup_type="success", duration=5)
                 else:
                     cin, cout = row
                     if cin and not cout:
-                        c.execute("UPDATE checkins SET check_out_time=? WHERE session_id=? AND attendee_id=?",
-                                  (now_str, self.session_id, aid))
+                        c.execute("UPDATE checkins SET check_out_time=? WHERE session_id=? AND student_id=?",
+                                  (now_str, self.session_id, sid))
                         self.show_timed_popup(f"{name} 簽退成功", popup_type="success", duration=5)
                     elif cin and cout:
                         self.show_timed_popup(f"{name} 已簽退，無法重複簽到", popup_type="info", duration=5)
                     else:
-                        c.execute("UPDATE checkins SET check_in_time=? WHERE session_id=? AND attendee_id=?",
-                                  (now_str, self.session_id, aid))
+                        c.execute("UPDATE checkins SET check_in_time=? WHERE session_id=? AND student_id=?",
+                                  (now_str, self.session_id, sid))
                         self.show_timed_popup(f"{name} 簽到成功", popup_type="success", duration=5)
 
                 conn.commit()
@@ -644,40 +746,39 @@ class CheckInApp:
 
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            c.execute("SELECT id, name FROM attendees WHERE class_id=?", (self.class_id,))
-            attendees = c.fetchall()
+            c.execute("""
+                SELECT s.id, s.name 
+                FROM students s
+                INNER JOIN class_students cs ON cs.student_id = s.id
+                WHERE cs.class_id = ? AND s.hash = ?
+            """, (self.class_id, code))
+            student = c.fetchone()
 
-            matched_attendee = None
-            for aid, name in attendees:
-                if hash_name(name) == code:
-                    matched_attendee = (aid, name)
-                    break
-
-            if not matched_attendee:
+            if not student:
                 self.show_timed_popup("查無此學員或QR碼錯誤", popup_type="error", duration=5)
                 return
 
-            aid, name = matched_attendee
-            c.execute("SELECT check_in_time, check_out_time FROM checkins WHERE session_id=? AND attendee_id=?",
-                      (self.session_id, aid))
+            sid, name = student
+            c.execute("SELECT check_in_time, check_out_time FROM checkins WHERE session_id=? AND student_id=?",
+                      (self.session_id, sid))
             row = c.fetchone()
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if not row:
-                c.execute("INSERT INTO checkins (session_id, attendee_id, check_in_time) VALUES (?, ?, ?)",
-                          (self.session_id, aid, now_str))
+                c.execute("INSERT INTO checkins (session_id, student_id, check_in_time) VALUES (?, ?, ?)",
+                          (self.session_id, sid, now_str))
                 self.show_timed_popup(f"{name} 簽到成功", popup_type="success", duration=5)
             else:
                 cin, cout = row
                 if cin and not cout:
-                    c.execute("UPDATE checkins SET check_out_time=? WHERE session_id=? AND attendee_id=?",
-                              (now_str, self.session_id, aid))
+                    c.execute("UPDATE checkins SET check_out_time=? WHERE session_id=? AND student_id=?",
+                              (now_str, self.session_id, sid))
                     self.show_timed_popup(f"{name} 簽退成功", popup_type="success", duration=5)
                 elif cin and cout:
                     self.show_timed_popup(f"{name} 已簽退，無法重複簽到", popup_type="info", duration=5)
                 else:
-                    c.execute("UPDATE checkins SET check_in_time=? WHERE session_id=? AND attendee_id=?",
-                              (now_str, self.session_id, aid))
+                    c.execute("UPDATE checkins SET check_in_time=? WHERE session_id=? AND student_id=?",
+                              (now_str, self.session_id, sid))
                     self.show_timed_popup(f"{name} 簽到成功", popup_type="success", duration=5)
 
             conn.commit()
@@ -760,13 +861,29 @@ class CheckInApp:
                 dept = row.get("部門", "").strip()
                 if not name:
                     continue
-                c.execute("SELECT id FROM attendees WHERE class_id=? AND name=?", (self.class_id, name))
-                if c.fetchone():
-                    continue
-                h = hash_name(name)
-                c.execute("INSERT INTO attendees (class_id, name, department, hash) VALUES (?, ?, ?, ?)",
-                          (self.class_id, name, dept, h))
-                added += 1
+                
+                # 檢查學員是否已存在
+                c.execute("SELECT id FROM students WHERE name=?", (name,))
+                student = c.fetchone()
+                
+                if student:
+                    student_id = student[0]
+                else:
+                    # 新增學員
+                    h = hash_name(name)
+                    c.execute("INSERT INTO students (name, department, hash) VALUES (?, ?, ?)",
+                             (name, dept, h))
+                    student_id = c.lastrowid
+                
+                # 檢查是否已經加入此課程
+                c.execute("SELECT id FROM class_students WHERE class_id=? AND student_id=?",
+                         (self.class_id, student_id))
+                if not c.fetchone():
+                    # 建立課程與學員的關聯
+                    c.execute("INSERT INTO class_students (class_id, student_id) VALUES (?, ?)",
+                             (self.class_id, student_id))
+                    added += 1
+            
             conn.commit()
         messagebox.showinfo("匯入完成", f"成功匯入 {added} 位學員")
         self.load_attendees()
@@ -815,9 +932,10 @@ class CheckInApp:
             # 出席記錄
             c.execute("""
                 SELECT a.name, a.department, ci.check_in_time, ci.check_out_time
-                FROM attendees a
-                LEFT JOIN checkins ci ON ci.attendee_id=a.id AND ci.session_id=?
-                WHERE a.class_id=?
+                FROM students a
+                INNER JOIN class_students cs ON cs.student_id = a.id
+                LEFT JOIN checkins ci ON ci.student_id = a.id AND ci.session_id = ?
+                WHERE cs.class_id = ?
                 ORDER BY a.name
             """, (self.session_id, self.class_id))
             records = c.fetchall()
@@ -899,14 +1017,19 @@ class CheckInApp:
 
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            c.execute("SELECT name FROM attendees WHERE class_id=?", (self.class_id,))
-            names = [row[0] for row in c.fetchall()]
-            if not names:
+            c.execute("""
+                SELECT s.name, s.hash
+                FROM students s
+                INNER JOIN class_students cs ON cs.student_id = s.id
+                WHERE cs.class_id = ?
+            """, (self.class_id,))
+            students = c.fetchall()
+            
+            if not students:
                 messagebox.showwarning("警告", "此課堂尚無學員")
                 return
 
-            for name in names:
-                h = hash_name(name)
+            for name, h in students:
                 backup_code = h[:10]
 
                 qr = qrcode.QRCode(
@@ -951,8 +1074,8 @@ class CheckInApp:
             return
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            for aid in selected:
-                c.execute("DELETE FROM attendees WHERE id=?", (aid,))
+            for sid in selected:
+                c.execute("DELETE FROM class_students WHERE class_id=? AND student_id=?", (self.class_id, sid))
             conn.commit()
         self.load_attendees()
         self.update_stats()
@@ -1065,23 +1188,645 @@ class CheckInApp:
 
         load_users()
 
+    def open_student_management(self):
+        StudentManagementDialog(self.root)
+
+    def logout_callback(self):
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
+
+class StudentManagementDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("學員管理")
+        self.geometry("800x600")
+        self.resizable(False, False)
+
+        # 建立搜尋框架
+        search_frame = ttk.Frame(self)
+        search_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(search_frame, text="搜尋：").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', self.filter_students)
+        ttk.Entry(search_frame, textvariable=self.search_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # 建立學員列表（含橫向scrollbar）
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(expand=True, fill=tk.BOTH, padx=10, pady=5)
+        self.tree = ttk.Treeview(tree_frame, columns=("name", "dept", "gender", "phone", "dietary"), show="headings")
+        self.tree.heading("name", text="姓名")
+        self.tree.heading("dept", text="部門")
+        self.tree.heading("gender", text="性別")
+        self.tree.heading("phone", text="連絡電話")
+        self.tree.heading("dietary", text="餐飲葷素")
+        self.tree.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+        xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        xscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree.configure(xscrollcommand=xscroll.set)
+
+        # 建立按鈕框架
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=5)
+        
+        ttk.Button(btn_frame, text="新增學員", command=self.add_student).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="編輯學員", command=self.edit_student).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="刪除學員", command=self.delete_student).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="匯入學員", command=self.import_students).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="匯出學員", command=self.export_students).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="管理欄位", command=self.manage_fields).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="關閉", command=self.destroy).pack(side=tk.RIGHT, padx=5)
+
+        self.load_students()
+
+    def load_students(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, name, department, gender, phone, dietary 
+                FROM students 
+                ORDER BY name
+            """)
+            for sid, name, dept, gender, phone, dietary in c.fetchall():
+                self.tree.insert("", tk.END, iid=sid, values=(name, dept, gender, phone, dietary))
+
+    def filter_students(self, *args):
+        search_text = self.search_var.get().lower()
+        for item in self.tree.get_children():
+            values = self.tree.item(item)['values']
+            if search_text in values[0].lower() or search_text in values[1].lower():
+                self.tree.item(item, tags=())
+            else:
+                self.tree.item(item, tags=('hidden',))
+        self.tree.tag_configure('hidden', foreground='gray')
+
+    def add_student(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("新增學員")
+        dialog.geometry("400x600")
+        dialog.resizable(False, False)
+
+        main_frame = ttk.Frame(dialog)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # 基本資料
+        basic_frame = ttk.LabelFrame(main_frame, text="基本資料", padding=10)
+        basic_frame.pack(fill=tk.X, pady=5)
+        row = 0
+        ttk.Label(basic_frame, text="姓名：").grid(row=row, column=0, sticky="e", pady=5)
+        name_var = tk.StringVar()
+        ttk.Entry(basic_frame, textvariable=name_var).grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        ttk.Label(basic_frame, text="部門：").grid(row=row, column=0, sticky="e", pady=5)
+        dept_var = tk.StringVar()
+        ttk.Entry(basic_frame, textvariable=dept_var).grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        # 性別
+        gender_var = tk.StringVar()
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT option_value FROM field_options WHERE field_id=1 ORDER BY display_order")
+            gender_options = [row_[0] for row_ in c.fetchall()]
+        ttk.Label(basic_frame, text="性別：").grid(row=row, column=0, sticky="e", pady=5)
+        ttk.Combobox(basic_frame, textvariable=gender_var, values=gender_options, state="readonly").grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        # 連絡電話
+        ttk.Label(basic_frame, text="連絡電話：").grid(row=row, column=0, sticky="e", pady=5)
+        phone_var = tk.StringVar()
+        ttk.Entry(basic_frame, textvariable=phone_var).grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        # 餐飲葷素
+        dietary_var = tk.StringVar()
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT option_value FROM field_options WHERE field_id=5 ORDER BY display_order")
+            dietary_options = [row_[0] for row_ in c.fetchall()]
+        ttk.Label(basic_frame, text="餐飲葷素：").grid(row=row, column=0, sticky="e", pady=5)
+        ttk.Combobox(basic_frame, textvariable=dietary_var, values=dietary_options, state="readonly").grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        basic_frame.columnconfigure(1, weight=1)
+
+        # 其他資料
+        custom_frame = ttk.LabelFrame(main_frame, text="其他資料", padding=10)
+        custom_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        custom_vars = {}
+        basic_names = {"姓名", "部門", "性別", "連絡電話", "餐飲葷素"}
+        shown_names = set()
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, field_name, field_type, is_required 
+                FROM custom_fields 
+                WHERE id NOT IN (1,3,5) 
+                ORDER BY display_order
+            """)
+            row = 0
+            for field_id, field_name, field_type, is_required in c.fetchall():
+                if field_name in basic_names or field_name in shown_names:
+                    continue
+                shown_names.add(field_name)
+                ttk.Label(custom_frame, text=f"{field_name}{'*' if is_required else ''}：").grid(row=row, column=0, sticky="e", pady=5)
+                if field_type == 'select':
+                    var = tk.StringVar()
+                    c.execute("SELECT option_value FROM field_options WHERE field_id=? ORDER BY display_order", (field_id,))
+                    options = [row_[0] for row_ in c.fetchall()]
+                    ttk.Combobox(custom_frame, textvariable=var, values=options, state="readonly").grid(row=row, column=1, sticky="we", pady=5)
+                else:
+                    var = tk.StringVar()
+                    ttk.Entry(custom_frame, textvariable=var).grid(row=row, column=1, sticky="we", pady=5)
+                custom_vars[field_id] = var
+                row += 1
+        custom_frame.columnconfigure(1, weight=1)
+
+        # 按鈕
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+        def save():
+            name = name_var.get().strip()
+            dept = dept_var.get().strip()
+            if not name:
+                messagebox.showwarning("警告", "姓名不能為空")
+                return
+            try:
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    h = hash_name(name)
+                    c.execute("""
+                        INSERT INTO students (name, department, hash, gender, phone, dietary) 
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (name, dept, h, gender_var.get(), phone_var.get(), dietary_var.get()))
+                    student_id = c.lastrowid
+                    for field_id, var in custom_vars.items():
+                        value = var.get().strip()
+                        if value:
+                            c.execute("""
+                                INSERT INTO student_custom_values (student_id, field_id, field_value)
+                                VALUES (?, ?, ?)
+                            """, (student_id, field_id, value))
+                    conn.commit()
+                dialog.destroy()
+                self.load_students()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("錯誤", "該學員已存在")
+        ttk.Button(btn_frame, text="儲存", command=save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        dialog.focus_set()
+
+    def edit_student(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("警告", "請選擇要編輯的學員")
+            return
+        if len(selected) > 1:
+            messagebox.showwarning("警告", "一次只能編輯一個學員")
+            return
+
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT name, department, gender, phone, dietary 
+                FROM students 
+                WHERE id=?
+            """, (selected[0],))
+            name, dept, gender, phone, dietary = c.fetchone()
+
+            # 取得自定義欄位值
+            c.execute("""
+                SELECT field_id, field_value 
+                FROM student_custom_values 
+                WHERE student_id=?
+            """, (selected[0],))
+            custom_values = dict(c.fetchall())
+
+        dialog = tk.Toplevel(self)
+        dialog.title("編輯學員")
+        dialog.geometry("400x600")
+        dialog.resizable(False, False)
+
+        main_frame = ttk.Frame(dialog)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # 基本資料
+        basic_frame = ttk.LabelFrame(main_frame, text="基本資料", padding=10)
+        basic_frame.pack(fill=tk.X, pady=5)
+        row = 0
+        ttk.Label(basic_frame, text="姓名：").grid(row=row, column=0, sticky="e", pady=5)
+        name_var = tk.StringVar(value=name)
+        ttk.Entry(basic_frame, textvariable=name_var).grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        ttk.Label(basic_frame, text="部門：").grid(row=row, column=0, sticky="e", pady=5)
+        dept_var = tk.StringVar(value=dept)
+        ttk.Entry(basic_frame, textvariable=dept_var).grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        # 性別
+        gender_var = tk.StringVar(value=gender)
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT option_value FROM field_options WHERE field_id=1 ORDER BY display_order")
+            gender_options = [row_[0] for row_ in c.fetchall()]
+        ttk.Label(basic_frame, text="性別：").grid(row=row, column=0, sticky="e", pady=5)
+        ttk.Combobox(basic_frame, textvariable=gender_var, values=gender_options, state="readonly").grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        # 連絡電話
+        ttk.Label(basic_frame, text="連絡電話：").grid(row=row, column=0, sticky="e", pady=5)
+        phone_var = tk.StringVar(value=phone)
+        ttk.Entry(basic_frame, textvariable=phone_var).grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        # 餐飲葷素
+        dietary_var = tk.StringVar(value=dietary)
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT option_value FROM field_options WHERE field_id=5 ORDER BY display_order")
+            dietary_options = [row_[0] for row_ in c.fetchall()]
+        ttk.Label(basic_frame, text="餐飲葷素：").grid(row=row, column=0, sticky="e", pady=5)
+        ttk.Combobox(basic_frame, textvariable=dietary_var, values=dietary_options, state="readonly").grid(row=row, column=1, sticky="we", pady=5)
+        row += 1
+        basic_frame.columnconfigure(1, weight=1)
+
+        # 其他資料
+        custom_frame = ttk.LabelFrame(main_frame, text="其他資料", padding=10)
+        custom_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        custom_vars = {}
+        basic_names = {"姓名", "部門", "性別", "連絡電話", "餐飲葷素"}
+        shown_names = set()
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, field_name, field_type, is_required 
+                FROM custom_fields 
+                WHERE id NOT IN (1,3,5) 
+                ORDER BY display_order
+            """)
+            row = 0
+            for field_id, field_name, field_type, is_required in c.fetchall():
+                if field_name in basic_names or field_name in shown_names:
+                    continue
+                shown_names.add(field_name)
+                ttk.Label(custom_frame, text=f"{field_name}{'*' if is_required else ''}：").grid(row=row, column=0, sticky="e", pady=5)
+                if field_type == 'select':
+                    var = tk.StringVar(value=custom_values.get(field_id, ""))
+                    c.execute("SELECT option_value FROM field_options WHERE field_id=? ORDER BY display_order", (field_id,))
+                    options = [row_[0] for row_ in c.fetchall()]
+                    ttk.Combobox(custom_frame, textvariable=var, values=options, state="readonly").grid(row=row, column=1, sticky="we", pady=5)
+                else:
+                    var = tk.StringVar(value=custom_values.get(field_id, ""))
+                    ttk.Entry(custom_frame, textvariable=var).grid(row=row, column=1, sticky="we", pady=5)
+                custom_vars[field_id] = var
+                row += 1
+        custom_frame.columnconfigure(1, weight=1)
+
+        # 按鈕
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+        def save():
+            new_name = name_var.get().strip()
+            new_dept = dept_var.get().strip()
+            if not new_name:
+                messagebox.showwarning("警告", "姓名不能為空")
+                return
+            try:
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    h = hash_name(new_name)
+                    c.execute("""
+                        UPDATE students 
+                        SET name=?, department=?, hash=?, gender=?, phone=?, dietary=?
+                        WHERE id=?
+                    """, (new_name, new_dept, h, gender_var.get(), phone_var.get(), dietary_var.get(), selected[0]))
+                    c.execute("DELETE FROM student_custom_values WHERE student_id=?", (selected[0],))
+                    for field_id, var in custom_vars.items():
+                        value = var.get().strip()
+                        if value:
+                            c.execute("""
+                                INSERT INTO student_custom_values (student_id, field_id, field_value)
+                                VALUES (?, ?, ?)
+                            """, (selected[0], field_id, value))
+                    conn.commit()
+                dialog.destroy()
+                self.load_students()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("錯誤", "該學員名稱已存在")
+        ttk.Button(btn_frame, text="儲存", command=save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        dialog.focus_set()
+
+    def manage_fields(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("管理欄位")
+        dialog.geometry("500x400")
+        dialog.resizable(False, False)
+
+        # 建立欄位列表
+        tree = ttk.Treeview(dialog, columns=("name", "type", "required"), show="headings")
+        tree.heading("name", text="欄位名稱")
+        tree.heading("type", text="欄位類型")
+        tree.heading("required", text="必填")
+        tree.pack(expand=True, fill=tk.BOTH, padx=10, pady=5)
+
+        def load_fields():
+            for row in tree.get_children():
+                tree.delete(row)
+            with sqlite3.connect(DB_FILE) as conn:
+                c = conn.cursor()
+                c.execute("""
+                    SELECT id, field_name, field_type, is_required 
+                    FROM custom_fields 
+                    ORDER BY display_order
+                """)
+                for fid, name, type_, required in c.fetchall():
+                    tree.insert("", tk.END, iid=fid, values=(name, type_, "是" if required else "否"))
+
+        def add_field():
+            field_dialog = tk.Toplevel(dialog)
+            field_dialog.title("新增欄位")
+            field_dialog.geometry("300x250")
+            field_dialog.resizable(False, False)
+
+            ttk.Label(field_dialog, text="欄位名稱：").pack(pady=5)
+            name_var = tk.StringVar()
+            ttk.Entry(field_dialog, textvariable=name_var).pack(pady=5, fill=tk.X, padx=10)
+
+            ttk.Label(field_dialog, text="欄位類型：").pack(pady=5)
+            type_var = tk.StringVar(value="text")
+            ttk.Combobox(field_dialog, textvariable=type_var, values=["text", "select"], state="readonly").pack(pady=5, fill=tk.X, padx=10)
+
+            required_var = tk.BooleanVar()
+            ttk.Checkbutton(field_dialog, text="必填欄位", variable=required_var).pack(pady=5)
+
+            def save_field():
+                name = name_var.get().strip()
+                if not name:
+                    messagebox.showwarning("警告", "欄位名稱不能為空")
+                    return
+
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    c.execute("""
+                        INSERT INTO custom_fields (field_name, field_type, is_required, display_order)
+                        VALUES (?, ?, ?, (SELECT COALESCE(MAX(display_order), 0) + 1 FROM custom_fields))
+                    """, (name, type_var.get(), int(required_var.get())))
+                    field_id = c.lastrowid
+
+                    if type_var.get() == "select":
+                        options_dialog = tk.Toplevel(field_dialog)
+                        options_dialog.title("設定選項")
+                        options_dialog.geometry("300x400")
+                        options_dialog.resizable(False, False)
+
+                        options_list = []
+                        options_frame = ttk.Frame(options_dialog)
+                        options_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+                        def add_option():
+                            option = simpledialog.askstring("新增選項", "請輸入選項值：")
+                            if option:
+                                options_list.append(option)
+                                update_options_list()
+
+                        def update_options_list():
+                            for widget in options_frame.winfo_children():
+                                widget.destroy()
+                            for i, option in enumerate(options_list):
+                                ttk.Label(options_frame, text=f"{i+1}. {option}").pack(pady=2)
+
+                        ttk.Button(options_frame, text="新增選項", command=add_option).pack(pady=5)
+
+                        def save_options():
+                            with sqlite3.connect(DB_FILE) as conn:
+                                c = conn.cursor()
+                                for i, option in enumerate(options_list):
+                                    c.execute("""
+                                        INSERT INTO field_options (field_id, option_value, display_order)
+                                        VALUES (?, ?, ?)
+                                    """, (field_id, option, i+1))
+                                conn.commit()
+                            options_dialog.destroy()
+                            field_dialog.destroy()
+                            load_fields()
+
+                        ttk.Button(options_dialog, text="儲存", command=save_options).pack(pady=10)
+                    else:
+                        conn.commit()
+                        field_dialog.destroy()
+                        load_fields()
+
+            ttk.Button(field_dialog, text="儲存", command=save_field).pack(pady=10)
+
+        def delete_field():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("警告", "請選擇要刪除的欄位")
+                return
+            if messagebox.askyesno("確認", "確定要刪除選取的欄位嗎？\n注意：刪除欄位將同時刪除所有相關的資料。"):
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    for fid in selected:
+                        c.execute("DELETE FROM field_options WHERE field_id=?", (fid,))
+                        c.execute("DELETE FROM student_custom_values WHERE field_id=?", (fid,))
+                        c.execute("DELETE FROM custom_fields WHERE id=?", (fid,))
+                    conn.commit()
+                load_fields()
+
+        # 建立按鈕框架
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text="新增欄位", command=add_field).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="刪除欄位", command=delete_field).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="關閉", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
+
+        load_fields()
+
+    def delete_student(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("警告", "請選擇要刪除的學員")
+            return
+        if messagebox.askyesno("確認", f"確定要刪除選取的 {len(selected)} 位學員嗎？"):
+            with sqlite3.connect(DB_FILE) as conn:
+                c = conn.cursor()
+                for sid in selected:
+                    c.execute("DELETE FROM students WHERE id=?", (sid,))
+                conn.commit()
+            self.load_students()
+
+    def import_students(self):
+        file_path = filedialog.askopenfilename(filetypes=[("CSV檔案", "*.csv")])
+        if not file_path:
+            return
+        try:
+            with open(file_path, newline='', encoding="utf-8") as csvfile:
+                reader = csv.DictReader(csvfile)
+                rows = list(reader)
+        except UnicodeDecodeError:
+            with open(file_path, newline='', encoding="cp950") as csvfile:
+                reader = csv.DictReader(csvfile)
+                rows = list(reader)
+        
+        # 取得所有自定義欄位
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, field_name, field_type 
+                FROM custom_fields 
+                ORDER BY display_order
+            """)
+            custom_fields = c.fetchall()
+        
+        added = 0
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            for row in rows:
+                name = row.get("姓名", "").strip()
+                dept = row.get("部門", "").strip()
+                if not name:
+                    continue
+                try:
+                    h = hash_name(name)
+                    # 插入基本資料
+                    c.execute("""
+                        INSERT INTO students (name, department, hash, gender, phone, dietary) 
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (name, dept, h,
+                          row.get("性別", ""),
+                          row.get("連絡電話", ""),
+                          row.get("餐飲葷素", "")))
+                    
+                    student_id = c.lastrowid
+                    
+                    # 插入其他自定義欄位值
+                    for field_id, field_name, field_type in custom_fields:
+                        if field_id not in [1, 3, 5]:  # 排除已處理的欄位
+                            value = row.get(field_name, "").strip()
+                            if value:
+                                c.execute("""
+                                    INSERT INTO student_custom_values (student_id, field_id, field_value)
+                                    VALUES (?, ?, ?)
+                                """, (student_id, field_id, value))
+                    
+                    added += 1
+                except sqlite3.IntegrityError:
+                    continue
+            conn.commit()
+        messagebox.showinfo("匯入完成", f"成功匯入 {added} 位學員")
+        self.load_students()
+
+    def export_students(self):
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV檔案", "*.csv")]
+        )
+        if not file_path:
+            return
+
+        # 取得所有自定義欄位
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, field_name, field_type 
+                FROM custom_fields 
+                ORDER BY display_order
+            """)
+            custom_fields = c.fetchall()
+
+            # 取得所有學員資料
+            c.execute("""
+                SELECT s.id, s.name, s.department, s.gender, s.phone, s.dietary,
+                       GROUP_CONCAT(f.field_name || ':' || v.field_value) as custom_values
+                FROM students s
+                LEFT JOIN student_custom_values v ON v.student_id = s.id
+                LEFT JOIN custom_fields f ON f.id = v.field_id
+                GROUP BY s.id
+                ORDER BY s.name
+            """)
+            students = c.fetchall()
+
+        # 準備欄位名稱
+        fieldnames = ["姓名", "部門", "性別", "連絡電話", "餐飲葷素"]
+        for _, field_name, _ in custom_fields:
+            if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
+                fieldnames.append(field_name)
+
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for student in students:
+                    sid, name, dept, gender, phone, dietary, custom_values = student
+                    row_data = {
+                        "姓名": name,
+                        "部門": dept,
+                        "性別": gender,
+                        "連絡電話": phone,
+                        "餐飲葷素": dietary
+                    }
+
+                    # 處理自定義欄位值
+                    if custom_values:
+                        for pair in custom_values.split(','):
+                            field_name, value = pair.split(':')
+                            if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
+                                row_data[field_name] = value
+
+                    writer.writerow(row_data)
+
+            messagebox.showinfo("匯出完成", "學員資料已成功匯出")
+        except Exception as e:
+            messagebox.showerror("錯誤", f"匯出失敗：{str(e)}")
+
 def main():
     root = tk.Tk()
-    root.withdraw()  # 隱藏主視窗
-    
+    root.withdraw()
+    login_window = None
+    app = None
+
+    def show_login():
+        nonlocal login_window
+        if login_window is not None:
+            try:
+                login_window.destroy()
+            except Exception:
+                pass
+        login_window = LoginWindow(root, on_login)
+        login_window.deiconify()
+        login_window.grab_set()
+        login_window.focus_force()
+
     def on_login(success, user_id, is_admin):
+        nonlocal app, login_window
         if success:
-            root.deiconify()  # 顯示主視窗
+            if login_window:
+                login_window.withdraw()
+            root.deiconify()
+            # 登入前先清空 root 內容
+            for widget in root.winfo_children():
+                if not isinstance(widget, LoginWindow):
+                    try:
+                        widget.destroy()
+                    except Exception:
+                        pass
+            if app:
+                app.destroy()
             app = CheckInApp(root)
             app.user_id = user_id
             app.is_admin = is_admin
             if not is_admin:
-                app.user_mgmt_btn.grid_remove()  # 隱藏使用者管理按鈕
-            root.mainloop()
+                app.user_mgmt_btn.grid_remove()
+            app.set_logout_callback(logout)
         else:
             root.destroy()
-    
-    login_window = LoginWindow(root, on_login)
+
+    def logout():
+        nonlocal app, login_window
+        if app:
+            app.destroy()
+            app = None
+        root.withdraw()
+        root.after(100, show_login)
+
+    show_login()
     root.mainloop()
 
 if __name__ == "__main__":
