@@ -19,6 +19,7 @@ import platform
 import winsound
 import json
 import pyttsx3
+from openpyxl import Workbook, load_workbook
 
 DB_FILE = "checkin.db"
 QR_FOLDER = "qrcodes"
@@ -28,7 +29,7 @@ if not os.path.exists(QR_FOLDER):
     os.makedirs(QR_FOLDER)
 
 def hash_name(name):
-    return hashlib.sha256((name + QR_SEED).encode()).hexdigest()
+    return hashlib.sha256(f"{name}{QR_SEED}".encode()).hexdigest()
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -58,7 +59,8 @@ def init_db():
         c.execute("""
         CREATE TABLE IF NOT EXISTS classes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL
+            name TEXT NOT NULL,
+            type TEXT
         )""")
         c.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
@@ -540,10 +542,20 @@ class CheckInApp:
     def load_classes(self):
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            c.execute("SELECT id, name FROM classes")
+            c.execute("SELECT id, name, type FROM classes")
             data = c.fetchall()
-        self.class_combo['values'] = [f"{row[1]} ({row[0]})" for row in data]
-        self.class_map = {f"{row[1]} ({row[0]})": row[0] for row in data}
+            
+            # 課程類型對應表
+            type_names = {
+                "single_event": "單次活動",
+                "single_meeting": "單次會議",
+                "single_class": "單堂課程",
+                "multi_session": "多堂課程",
+                "multi_event": "多堂活動"
+            }
+            
+            self.class_combo['values'] = [f"{row[1]} ({type_names.get(row[2], '未知類型')})" for row in data]
+            self.class_map = {f"{row[1]} ({type_names.get(row[2], '未知類型')})": row[0] for row in data}
 
     def select_class(self):
         selected = self.class_combo.get()
@@ -554,13 +566,43 @@ class CheckInApp:
             self.update_stats()
 
     def add_class(self):
-        name = simpledialog.askstring("新增活動(課程)", "輸入活動(課程)名稱")
-        if name:
-            with sqlite3.connect(DB_FILE) as conn:
-                c = conn.cursor()
-                c.execute("INSERT INTO classes (name) VALUES (?)", (name,))
-                conn.commit()
-            self.load_classes()
+        # 建立課程類型選擇視窗
+        type_dialog = tk.Toplevel(self.root)
+        type_dialog.title("選擇課程類型")
+        type_dialog.geometry("300x200")
+        type_dialog.resizable(False, False)
+        
+        # 課程類型選項
+        class_types = [
+            ("單次活動", "single_event"),
+            ("單次會議", "single_meeting"),
+            ("單堂課程", "single_class"),
+            ("多堂課程", "multi_session"),
+            ("多堂活動", "multi_event")
+        ]
+        
+        selected_type = tk.StringVar(value="multi_session")
+        
+        # 建立選項按鈕
+        for text, value in class_types:
+            ttk.Radiobutton(type_dialog, text=text, value=value, variable=selected_type).pack(pady=5)
+        
+        def on_type_selected():
+            type_dialog.destroy()
+            name = simpledialog.askstring("新增活動(課程)", "輸入活動(課程)名稱")
+            if name:
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    c.execute("INSERT INTO classes (name, type) VALUES (?, ?)", (name, selected_type.get()))
+                    conn.commit()
+                self.load_classes()
+                
+                # 如果是單次類型，自動開啟新增堂次視窗
+                if selected_type.get() in ["single_event", "single_meeting", "single_class"]:
+                    self.class_id = c.lastrowid
+                    self.add_session()
+        
+        ttk.Button(type_dialog, text="確定", command=on_type_selected).pack(pady=10)
 
     def load_sessions(self):
         if not self.class_id:
@@ -585,15 +627,31 @@ class CheckInApp:
             messagebox.showwarning("警告", "請先選擇活動(課程)")
             return
 
+        # 檢查課程類型
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT type FROM classes WHERE id=?", (self.class_id,))
+            class_type = c.fetchone()[0]
+            
+            # 如果是單次類型，檢查是否已有堂次
+            if class_type in ["single_event", "single_meeting", "single_class"]:
+                c.execute("SELECT COUNT(*) FROM sessions WHERE class_id=?", (self.class_id,))
+                if c.fetchone()[0] > 0:
+                    messagebox.showwarning("警告", "單次活動只能新增一個堂次")
+                    return
+
+            # 獲取當前最大周次
+            c.execute("SELECT MAX(week) FROM sessions WHERE class_id=?", (self.class_id,))
+            max_week = c.fetchone()[0]
+            next_week = 1 if max_week is None else max_week + 1
+
         top = tk.Toplevel(self.root)
         top.title("新增週次")
         top.geometry("300x300")
         top.resizable(False, False)
 
-        ttk.Label(top, text="週次:").pack(pady=5)
-        week_var = tk.IntVar()
-        ttk.Entry(top, textvariable=week_var).pack(pady=5)
-
+        ttk.Label(top, text=f"週次: {next_week}").pack(pady=5)
+        
         ttk.Label(top, text="日期 (YYYY-MM-DD):").pack(pady=5)
         date_entry = DateEntry(top, date_pattern='yyyy-MM-dd')
         date_entry.pack(pady=5)
@@ -608,7 +666,6 @@ class CheckInApp:
 
         def save():
             try:
-                week = week_var.get()
                 date = date_entry.get_date().strftime("%Y-%m-%d")
                 start = start_var.get().strip()
                 end = end_var.get().strip()
@@ -619,26 +676,19 @@ class CheckInApp:
 
                 with sqlite3.connect(DB_FILE) as conn:
                     c = conn.cursor()
-                    # 檢查是否已有相同週次
-                    c.execute("SELECT id FROM sessions WHERE class_id=? AND week=?", (self.class_id, week))
-                    if c.fetchone():
-                        messagebox.showerror("錯誤", f"第 {week} 週已存在")
-                        return
-
                     c.execute(
                         "INSERT INTO sessions (class_id, week, date, start_time, end_time) VALUES (?, ?, ?, ?, ?)",
-                        (self.class_id, week, date, start, end)
+                        (self.class_id, next_week, date, start, end)
                     )
                     conn.commit()
 
-                messagebox.showinfo("成功", f"已新增第 {week} 週")
+                messagebox.showinfo("成功", f"已新增第 {next_week} 週")
                 top.destroy()
                 self.load_sessions()
 
             except Exception as e:
                 messagebox.showerror("錯誤", f"無法儲存週次：{e}")
 
-        # ✅ 修正：確保這個按鈕在 `save` 完整定義後才出現
         ttk.Button(top, text="儲存", command=save).pack(pady=10)
 
     def load_attendees(self):
@@ -688,20 +738,23 @@ class CheckInApp:
 
             with sqlite3.connect(DB_FILE) as conn:
                 c = conn.cursor()
-                c.execute("SELECT id, name FROM students WHERE class_id=?", (self.class_id,))
-                students = c.fetchall()
-
-                matched_student = None
-                for sid, name in students:
-                    if hash_name(name) == code:
-                        matched_student = (sid, name)
-                        break
-
-                if not matched_student:
+                # 先檢查學員是否存在
+                c.execute("SELECT id, name FROM students WHERE substr(hash, 1, 10) = ?", (code,))
+                student = c.fetchone()
+                
+                if not student:
                     self.show_timed_popup("查無此學員或備用碼錯誤", popup_type="error", duration=5)
                     return
+                
+                sid, name = student
+                
+                # 檢查學員是否已加入課程
+                c.execute("SELECT 1 FROM class_students WHERE class_id = ? AND student_id = ?", 
+                         (self.class_id, sid))
+                if not c.fetchone():
+                    self.show_timed_popup(f"{name} 尚未加入此課程，請先加入課程", popup_type="warning", duration=5)
+                    return
 
-                sid, name = matched_student
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 c.execute("SELECT check_in_time, check_out_time FROM checkins WHERE session_id=? AND student_id=?",
                           (self.session_id, sid))
@@ -839,21 +892,46 @@ class CheckInApp:
         update_countdown(duration)
 
     def import_attendees(self):
+        # 設定日誌檔案
+        log_file = "import_log.txt"
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("開始匯入程序...\n")
+        
+        def log_message(msg):
+            print(msg)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"{msg}\n")
+        
         if not self.class_id:
             messagebox.showwarning("警告", "請先選擇活動(課程)")
             return
+            
         file_path = filedialog.askopenfilename(filetypes=[("CSV檔案", "*.csv")])
         if not file_path:
             return
+            
+        log_message(f"選擇的檔案：{file_path}")
+        
         try:
             with open(file_path, newline='', encoding="utf-8") as csvfile:
-                reader = csv.DictReader(csvfile)
+                reader = csv.reader(csvfile)
+                headers = next(reader)
+                log_message(f"CSV 標題列: {headers}")
                 rows = list(reader)
+                log_message(f"讀取到 {len(rows)} 筆資料")
         except UnicodeDecodeError:
             with open(file_path, newline='', encoding="cp950") as csvfile:
-                reader = csv.DictReader(csvfile)
+                reader = csv.reader(csvfile)
+                headers = next(reader)
+                log_message(f"CSV 標題列 (cp950): {headers}")
                 rows = list(reader)
+                log_message(f"讀取到 {len(rows)} 筆資料 (cp950)")
+        
         added = 0
+        skipped = 0
+        updated = 0
+        duplicate_action = None  # None=詢問, "skip"=跳過, "update"=更新, "skip_all"=跳過全部, "update_all"=強制更新全部
+        
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
             for row in rows:
@@ -868,26 +946,145 @@ class CheckInApp:
                 
                 if student:
                     student_id = student[0]
-                else:
-                    # 新增學員
-                    h = hash_name(name)
-                    c.execute("INSERT INTO students (name, department, hash) VALUES (?, ?, ?)",
-                             (name, dept, h))
-                    student_id = c.lastrowid
+                    
+                    if duplicate_action is None:
+                        # 取得現有資料
+                        c.execute("""
+                            SELECT s.department, s.gender, s.phone, s.dietary,
+                                   f.field_name, scv.field_value
+                            FROM students s
+                            LEFT JOIN student_custom_values scv ON scv.student_id = s.id
+                            LEFT JOIN custom_fields f ON f.id = scv.field_id
+                            WHERE s.id = ?
+                            ORDER BY f.display_order
+                        """, (student_id,))
+                        existing_data = c.fetchall()
+                        
+                        existing_dept = existing_data[0][0] if existing_data else ""
+                        existing_gender = existing_data[0][1] if existing_data else ""
+                        existing_phone = existing_data[0][2] if existing_data else ""
+                        existing_dietary = existing_data[0][3] if existing_data else ""
+                        
+                        existing_custom = "\n".join([f"{row[4]}：{row[5]}" for row in existing_data if row[4] and row[5]])
+                        
+                        new_data = f"部門：{row.get('部門', '')}\n"
+                        new_data += f"性別：{row.get('性別', '')}\n"
+                        new_data += f"連絡電話：{row.get('連絡電話', '')}\n"
+                        new_data += f"餐飲葷素：{row.get('餐飲葷素', '')}\n"
+                        for field_id, field_name, _ in custom_fields:
+                            if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
+                                value = row.get(field_name, "")
+                                if value:
+                                    new_data += f"{field_name}：{value}\n"
+                        
+                        response = messagebox.askyesnocancel(
+                            "發現重複學員",
+                            f"發現重複學員：{name}\n\n"
+                            f"現有資料：\n"
+                            f"部門：{existing_dept}\n"
+                            f"性別：{existing_gender}\n"
+                            f"連絡電話：{existing_phone}\n"
+                            f"餐飲葷素：{existing_dietary}\n"
+                            f"{existing_custom}\n\n"
+                            f"新資料：\n{new_data}\n"
+                            "是否要覆蓋現有資料？\n"
+                            "是 = 覆蓋\n"
+                            "否 = 跳過\n"
+                            "取消 = 顯示更多選項"
+                        )
+                        
+                        if response is None:  # 取消，顯示更多選項
+                            response = messagebox.askyesnocancel(
+                                "更多選項",
+                                "選擇處理方式：\n"
+                                "是 = 跳過所有重複\n"
+                                "否 = 強制更新所有重複\n"
+                                "取消 = 返回上一層"
+                            )
+                            if response is None:  # 返回上一層
+                                continue
+                            elif response:  # 跳過所有重複
+                                duplicate_action = "skip_all"
+                                skipped += 1
+                                continue
+                            else:  # 強制更新所有重複
+                                duplicate_action = "update_all"
+                        elif response:  # 覆蓋
+                            duplicate_action = "update"
+                        else:  # 跳過
+                            duplicate_action = "skip"
+                            skipped += 1
+                            continue
+                    
+                    if duplicate_action == "skip_all":
+                        skipped += 1
+                        continue
+                    elif duplicate_action == "update_all":
+                        # 強制更新所有重複
+                        pass
+                    elif duplicate_action == "skip":
+                        skipped += 1
+                        continue
+                    elif duplicate_action == "update":
+                        # 更新基本資料
+                        c.execute("""
+                            UPDATE students 
+                            SET department=?, gender=?, phone=?, dietary=?
+                            WHERE id=?
+                        """, (dept, row.get("性別", ""), row.get("連絡電話", ""), 
+                              row.get("餐飲葷素", ""), student_id))
+                        
+                        # 更新自定義欄位值
+                        c.execute("DELETE FROM student_custom_values WHERE student_id=?", (student_id,))
+                        for field_id, field_name, _ in custom_fields:
+                            if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
+                                value = row.get(field_name, "").strip()
+                                if value:
+                                    c.execute("""
+                                        INSERT INTO student_custom_values (student_id, field_id, field_value)
+                                        VALUES (?, ?, ?)
+                                    """, (student_id, field_id, value))
+                        updated += 1
+                        continue
                 
-                # 檢查是否已經加入此課程
-                c.execute("SELECT id FROM class_students WHERE class_id=? AND student_id=?",
-                         (self.class_id, student_id))
-                if not c.fetchone():
-                    # 建立課程與學員的關聯
-                    c.execute("INSERT INTO class_students (class_id, student_id) VALUES (?, ?)",
-                             (self.class_id, student_id))
+                try:
+                    h = hash_name(name)
+                    # 插入基本資料
+                    c.execute("""
+                        INSERT INTO students (name, department, hash, gender, phone, dietary) 
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (name, dept, h,
+                          row.get("性別", ""),
+                          row.get("連絡電話", ""),
+                          row.get("餐飲葷素", "")))
+                    
+                    student_id = c.lastrowid
+                    
+                    # 插入其他自定義欄位值
+                    for field_id, field_name, _ in custom_fields:
+                        if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
+                            value = row.get(field_name, "").strip()
+                            if value:
+                                c.execute("""
+                                    INSERT INTO student_custom_values (student_id, field_id, field_value)
+                                    VALUES (?, ?, ?)
+                                """, (student_id, field_id, value))
+                    
                     added += 1
-            
+                except sqlite3.IntegrityError:
+                    continue
             conn.commit()
-        messagebox.showinfo("匯入完成", f"成功匯入 {added} 位學員")
-        self.load_attendees()
-        self.update_stats()
+        
+        result_message = f"匯入完成：\n"
+        if added > 0:
+            result_message += f"新增：{added} 位\n"
+        if updated > 0:
+            result_message += f"更新：{updated} 位\n"
+        if skipped > 0:
+            result_message += f"跳過：{skipped} 位"
+        
+        messagebox.showinfo("匯入完成", result_message)
+        self.load_students()
 
     def export_records(self):
         if not self.class_id or not self.session_id:
@@ -1652,17 +1849,22 @@ class StudentManagementDialog(tk.Toplevel):
             self.load_students()
 
     def import_students(self):
-        file_path = filedialog.askopenfilename(filetypes=[("CSV檔案", "*.csv")])
+        file_path = filedialog.askopenfilename(filetypes=[("Excel檔案", "*.xlsx;*.xls")])
         if not file_path:
             return
         try:
-            with open(file_path, newline='', encoding="utf-8") as csvfile:
-                reader = csv.DictReader(csvfile)
-                rows = list(reader)
-        except UnicodeDecodeError:
-            with open(file_path, newline='', encoding="cp950") as csvfile:
-                reader = csv.DictReader(csvfile)
-                rows = list(reader)
+            wb = load_workbook(file_path)
+            ws = wb.active
+            rows = []
+            headers = [cell.value for cell in ws[1]]
+            for row in ws.iter_rows(min_row=2):
+                row_data = {}
+                for header, cell in zip(headers, row):
+                    row_data[header] = str(cell.value).strip() if cell.value else ""
+                rows.append(row_data)
+        except Exception as e:
+            messagebox.showerror("錯誤", f"讀取Excel檔案失敗：{str(e)}")
+            return
         
         # 取得所有自定義欄位
         with sqlite3.connect(DB_FILE) as conn:
@@ -1675,6 +1877,10 @@ class StudentManagementDialog(tk.Toplevel):
             custom_fields = c.fetchall()
         
         added = 0
+        skipped = 0
+        updated = 0
+        duplicate_action = None  # None=詢問, "skip"=跳過, "update"=更新, "skip_all"=跳過全部, "update_all"=強制更新全部
+        
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
             for row in rows:
@@ -1682,6 +1888,114 @@ class StudentManagementDialog(tk.Toplevel):
                 dept = row.get("部門", "").strip()
                 if not name:
                     continue
+                
+                # 檢查學員是否已存在
+                c.execute("SELECT id FROM students WHERE name=?", (name,))
+                student = c.fetchone()
+                
+                if student:
+                    student_id = student[0]
+                    
+                    if duplicate_action is None:
+                        # 取得現有資料
+                        c.execute("""
+                            SELECT s.department, s.gender, s.phone, s.dietary,
+                                   f.field_name, scv.field_value
+                            FROM students s
+                            LEFT JOIN student_custom_values scv ON scv.student_id = s.id
+                            LEFT JOIN custom_fields f ON f.id = scv.field_id
+                            WHERE s.id = ?
+                            ORDER BY f.display_order
+                        """, (student_id,))
+                        existing_data = c.fetchall()
+                        
+                        existing_dept = existing_data[0][0] if existing_data else ""
+                        existing_gender = existing_data[0][1] if existing_data else ""
+                        existing_phone = existing_data[0][2] if existing_data else ""
+                        existing_dietary = existing_data[0][3] if existing_data else ""
+                        
+                        existing_custom = "\n".join([f"{row[4]}：{row[5]}" for row in existing_data if row[4] and row[5]])
+                        
+                        new_data = f"部門：{row.get('部門', '')}\n"
+                        new_data += f"性別：{row.get('性別', '')}\n"
+                        new_data += f"連絡電話：{row.get('連絡電話', '')}\n"
+                        new_data += f"餐飲葷素：{row.get('餐飲葷素', '')}\n"
+                        for field_id, field_name, _ in custom_fields:
+                            if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
+                                value = row.get(field_name, "")
+                                if value:
+                                    new_data += f"{field_name}：{value}\n"
+                        
+                        response = messagebox.askyesnocancel(
+                            "發現重複學員",
+                            f"發現重複學員：{name}\n\n"
+                            f"現有資料：\n"
+                            f"部門：{existing_dept}\n"
+                            f"性別：{existing_gender}\n"
+                            f"連絡電話：{existing_phone}\n"
+                            f"餐飲葷素：{existing_dietary}\n"
+                            f"{existing_custom}\n\n"
+                            f"新資料：\n{new_data}\n"
+                            "是否要覆蓋現有資料？\n"
+                            "是 = 覆蓋\n"
+                            "否 = 跳過\n"
+                            "取消 = 顯示更多選項"
+                        )
+                        
+                        if response is None:  # 取消，顯示更多選項
+                            response = messagebox.askyesnocancel(
+                                "更多選項",
+                                "選擇處理方式：\n"
+                                "是 = 跳過所有重複\n"
+                                "否 = 強制更新所有重複\n"
+                                "取消 = 返回上一層"
+                            )
+                            if response is None:  # 返回上一層
+                                continue
+                            elif response:  # 跳過所有重複
+                                duplicate_action = "skip_all"
+                                skipped += 1
+                                continue
+                            else:  # 強制更新所有重複
+                                duplicate_action = "update_all"
+                        elif response:  # 覆蓋
+                            duplicate_action = "update"
+                        else:  # 跳過
+                            duplicate_action = "skip"
+                            skipped += 1
+                            continue
+                    
+                    if duplicate_action == "skip_all":
+                        skipped += 1
+                        continue
+                    elif duplicate_action == "update_all":
+                        # 強制更新所有重複
+                        pass
+                    elif duplicate_action == "skip":
+                        skipped += 1
+                        continue
+                    elif duplicate_action == "update":
+                        # 更新基本資料
+                        c.execute("""
+                            UPDATE students 
+                            SET department=?, gender=?, phone=?, dietary=?
+                            WHERE id=?
+                        """, (dept, row.get("性別", ""), row.get("連絡電話", ""), 
+                              row.get("餐飲葷素", ""), student_id))
+                        
+                        # 更新自定義欄位值
+                        c.execute("DELETE FROM student_custom_values WHERE student_id=?", (student_id,))
+                        for field_id, field_name, _ in custom_fields:
+                            if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
+                                value = row.get(field_name, "").strip()
+                                if value:
+                                    c.execute("""
+                                        INSERT INTO student_custom_values (student_id, field_id, field_value)
+                                        VALUES (?, ?, ?)
+                                    """, (student_id, field_id, value))
+                        updated += 1
+                        continue
+                
                 try:
                     h = hash_name(name)
                     # 插入基本資料
@@ -1696,8 +2010,8 @@ class StudentManagementDialog(tk.Toplevel):
                     student_id = c.lastrowid
                     
                     # 插入其他自定義欄位值
-                    for field_id, field_name, field_type in custom_fields:
-                        if field_id not in [1, 3, 5]:  # 排除已處理的欄位
+                    for field_id, field_name, _ in custom_fields:
+                        if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
                             value = row.get(field_name, "").strip()
                             if value:
                                 c.execute("""
@@ -1709,13 +2023,22 @@ class StudentManagementDialog(tk.Toplevel):
                 except sqlite3.IntegrityError:
                     continue
             conn.commit()
-        messagebox.showinfo("匯入完成", f"成功匯入 {added} 位學員")
+        
+        result_message = f"匯入完成：\n"
+        if added > 0:
+            result_message += f"新增：{added} 位\n"
+        if updated > 0:
+            result_message += f"更新：{updated} 位\n"
+        if skipped > 0:
+            result_message += f"跳過：{skipped} 位"
+        
+        messagebox.showinfo("匯入完成", result_message)
         self.load_students()
 
     def export_students(self):
         file_path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV檔案", "*.csv")]
+            defaultextension=".xlsx",
+            filetypes=[("Excel檔案", "*.xlsx")]
         )
         if not file_path:
             return
@@ -1749,29 +2072,44 @@ class StudentManagementDialog(tk.Toplevel):
                 fieldnames.append(field_name)
 
         try:
-            with open(file_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
+            wb = Workbook()
+            ws = wb.active
+            
+            # 寫入標題列
+            for col, fieldname in enumerate(fieldnames, 1):
+                ws.cell(row=1, column=col, value=fieldname)
 
-                for student in students:
-                    sid, name, dept, gender, phone, dietary, custom_values = student
-                    row_data = {
-                        "姓名": name,
-                        "部門": dept,
-                        "性別": gender,
-                        "連絡電話": phone,
-                        "餐飲葷素": dietary
-                    }
+            # 寫入資料
+            for row_idx, student in enumerate(students, 2):
+                sid, name, dept, gender, phone, dietary, custom_values = student
+                ws.cell(row=row_idx, column=1, value=name)
+                ws.cell(row=row_idx, column=2, value=dept)
+                ws.cell(row=row_idx, column=3, value=gender)
+                ws.cell(row=row_idx, column=4, value=phone)
+                ws.cell(row=row_idx, column=5, value=dietary)
 
-                    # 處理自定義欄位值
-                    if custom_values:
-                        for pair in custom_values.split(','):
-                            field_name, value = pair.split(':')
-                            if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
-                                row_data[field_name] = value
+                # 處理自定義欄位值
+                if custom_values:
+                    for pair in custom_values.split(','):
+                        field_name, value = pair.split(':')
+                        if field_name not in ["性別", "連絡電話", "餐飲葷素"]:
+                            col_idx = fieldnames.index(field_name) + 1
+                            ws.cell(row=row_idx, column=col_idx, value=value)
 
-                    writer.writerow(row_data)
+            # 調整欄寬
+            for col in ws.columns:
+                max_length = 0
+                column = col[0].column_letter
+                for cell in col:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = (max_length + 2)
+                ws.column_dimensions[column].width = adjusted_width
 
+            wb.save(file_path)
             messagebox.showinfo("匯出完成", "學員資料已成功匯出")
         except Exception as e:
             messagebox.showerror("錯誤", f"匯出失敗：{str(e)}")

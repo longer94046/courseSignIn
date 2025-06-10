@@ -27,7 +27,8 @@ def init_db():
         c.execute("""
         CREATE TABLE IF NOT EXISTS classes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL
+            name TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'multi_session'
         )""")
         c.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
